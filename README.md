@@ -2,14 +2,16 @@
 
 > ⚠️ **DANGER — DO NOT USE IN PRODUCTION** ⚠️
 >
-> This plugin adds an `/exec` slash command that runs **arbitrary shell commands
-> on the host machine** running the Mattermost server. Although it is restricted
-> to system administrators, it effectively grants a remote shell on your server
-> and has **no sandboxing, no audit trail, and no input restrictions**. It is a
-> prototype intended for local development and experimentation only. Never deploy
-> it to a production or internet-facing environment.
+> This plugin puts an **interactive shell on the host machine** running the
+> Mattermost server, reachable from chat — plus `/exec` and `/inspect` commands
+> for one-off use. Although everything is restricted to system administrators, it
+> effectively grants a remote shell on your server and has **no sandboxing, no
+> audit trail, and no resource limits**. It is an experiment intended for labs and
+> pre-prod environments only. Never deploy it to production or an internet-facing
+> environment.
 
-A Mattermost plugin that runs shell commands on the host machine from a slash command.
+A Mattermost plugin that gives system admins an interactive shell on the host —
+as a right-hand-sidebar terminal, plus `/exec` and `/inspect` slash commands.
 
 ## Usage
 
