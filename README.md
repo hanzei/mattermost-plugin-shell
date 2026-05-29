@@ -76,6 +76,11 @@ executables in common bin directories, and `cat` reads a file (e.g.
 
 ![/inspect info output](docs/inspect.png)
 
+`/inspect cat <path>` reads a file directly — handy where no shell or `cat`
+binary exists:
+
+![/inspect cat /proc/uptime output](docs/inspect-cat.png)
+
 ## Development
 
 Requires Go and Node (see `.nvmrc`; run `nvm i` to match).
