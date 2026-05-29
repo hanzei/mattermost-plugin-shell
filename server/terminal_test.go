@@ -2,6 +2,83 @@ package main
 
 import "testing"
 
+func TestResolveShell(t *testing.T) {
+	detected := []shellInfo{
+		{Name: "bash", Path: "/bin/bash"},
+		{Name: "zsh", Path: "/bin/zsh"},
+		{Name: "sh", Path: "/bin/sh"},
+	}
+
+	tests := []struct {
+		name      string
+		requested string
+		saved     string
+		detected  []shellInfo
+		wantName  string
+		wantOK    bool
+	}{
+		{
+			name:      "valid request wins",
+			requested: "zsh",
+			saved:     "bash",
+			detected:  detected,
+			wantName:  "zsh",
+			wantOK:    true,
+		},
+		{
+			name:      "unknown request is ignored, falls back to saved",
+			requested: "powershell",
+			saved:     "zsh",
+			detected:  detected,
+			wantName:  "zsh",
+			wantOK:    true,
+		},
+		{
+			name:     "saved preference used when no request",
+			saved:    "sh",
+			detected: detected,
+			wantName: "sh",
+			wantOK:   true,
+		},
+		{
+			name:     "saved preference no longer present falls back to default",
+			saved:    "fish",
+			detected: detected,
+			wantName: "bash",
+			wantOK:   true,
+		},
+		{
+			name:     "default prefers bash then sh",
+			detected: []shellInfo{{Name: "sh", Path: "/bin/sh"}, {Name: "zsh", Path: "/bin/zsh"}},
+			wantName: "sh",
+			wantOK:   true,
+		},
+		{
+			name:     "default falls through to first detected",
+			detected: []shellInfo{{Name: "zsh", Path: "/bin/zsh"}, {Name: "fish", Path: "/usr/bin/fish"}},
+			wantName: "zsh",
+			wantOK:   true,
+		},
+		{
+			name:     "no shells detected",
+			detected: nil,
+			wantOK:   false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := resolveShell(tc.requested, tc.saved, tc.detected)
+			if ok != tc.wantOK {
+				t.Fatalf("resolveShell ok = %v, want %v", ok, tc.wantOK)
+			}
+			if ok && got.Name != tc.wantName {
+				t.Errorf("resolveShell name = %q, want %q", got.Name, tc.wantName)
+			}
+		})
+	}
+}
+
 func TestOriginAllowed(t *testing.T) {
 	tests := []struct {
 		name    string

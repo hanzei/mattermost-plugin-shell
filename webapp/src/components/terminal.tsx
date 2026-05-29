@@ -13,9 +13,18 @@ type ClientMessage =
     | {type: 'data'; data: string}
     | {type: 'resize'; cols: number; rows: number};
 
-function terminalSocketURL(): string {
+type ShellInfo = {name: string; path: string};
+
+type ShellsResponse = {shells: ShellInfo[]; selected: string};
+
+function pluginURL(path: string): string {
+    return `/plugins/${manifest.id}/api/v1/${path}`;
+}
+
+function terminalSocketURL(shell: string): string {
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${proto}//${window.location.host}/plugins/${manifest.id}/api/v1/terminal`;
+    const query = shell ? `?shell=${encodeURIComponent(shell)}` : '';
+    return `${proto}//${window.location.host}${pluginURL('terminal')}${query}`;
 }
 
 const HostTerminal: React.FC = () => {
@@ -24,6 +33,8 @@ const HostTerminal: React.FC = () => {
     const fitRef = useRef<FitAddon | null>(null);
     const socketRef = useRef<WebSocket | null>(null);
 
+    const [shells, setShells] = useState<ShellInfo[]>([]);
+    const [selected, setSelected] = useState<string | null>(null);
     const [status, setStatus] = useState<'connecting' | 'open' | 'closed'>('connecting');
 
     const send = useCallback((msg: ClientMessage) => {
@@ -47,6 +58,7 @@ const HostTerminal: React.FC = () => {
         send({type: 'resize', cols: term.cols, rows: term.rows});
     }, [send]);
 
+    // Create the xterm instance once; it persists across shell switches.
     useEffect(() => {
         if (!containerRef.current) {
             return undefined;
@@ -66,7 +78,55 @@ const HostTerminal: React.FC = () => {
         termRef.current = term;
         fitRef.current = fit;
 
-        const socket = new WebSocket(terminalSocketURL());
+        const dataSub = term.onData((data) => send({type: 'data', data}));
+        const onWindowResize = () => fitAndResize();
+        window.addEventListener('resize', onWindowResize);
+
+        return () => {
+            window.removeEventListener('resize', onWindowResize);
+            dataSub.dispose();
+            term.dispose();
+            termRef.current = null;
+            fitRef.current = null;
+        };
+    }, [send, fitAndResize]);
+
+    // Load the available shells and the saved selection.
+    useEffect(() => {
+        let cancelled = false;
+        fetch(pluginURL('shells'), {credentials: 'same-origin'}).
+            then((res) => res.json()).
+            then((data: ShellsResponse) => {
+                if (cancelled) {
+                    return;
+                }
+                setShells(data.shells || []);
+                setSelected(data.selected || '');
+            }).
+            catch(() => {
+                if (!cancelled) {
+                    setSelected(''); // fall back to the server default
+                }
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, []);
+
+    // Connect the socket once a shell is known; reconnect when it changes.
+    useEffect(() => {
+        if (selected === null) {
+            return undefined; // wait for the shells fetch to resolve
+        }
+        const term = termRef.current;
+        if (!term) {
+            return undefined;
+        }
+
+        term.reset();
+        setStatus('connecting');
+
+        const socket = new WebSocket(terminalSocketURL(selected));
         socket.binaryType = 'arraybuffer';
         socketRef.current = socket;
 
@@ -87,20 +147,12 @@ const HostTerminal: React.FC = () => {
             term.write('\r\n\x1b[31m[session closed]\x1b[0m\r\n');
         };
 
-        const dataSub = term.onData((data) => send({type: 'data', data}));
-        const onWindowResize = () => fitAndResize();
-        window.addEventListener('resize', onWindowResize);
-
         return () => {
-            window.removeEventListener('resize', onWindowResize);
-            dataSub.dispose();
+            socket.onclose = null; // avoid the "[session closed]" notice on switch
             socket.close();
-            term.dispose();
             socketRef.current = null;
-            termRef.current = null;
-            fitRef.current = null;
         };
-    }, [send, fitAndResize]);
+    }, [selected, send]);
 
     const wrapperStyle: React.CSSProperties = {
         display: 'flex',
@@ -113,6 +165,10 @@ const HostTerminal: React.FC = () => {
         <div style={wrapperStyle}>
             <div
                 style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: 8,
                     padding: '6px 10px',
                     color: '#ddd',
                     fontSize: 12,
@@ -120,6 +176,31 @@ const HostTerminal: React.FC = () => {
                 }}
             >
                 <span>{'Host terminal · '}{status}</span>
+                {shells.length > 0 && (
+                    <label style={{display: 'flex', alignItems: 'center', gap: 4}}>
+                        <span>{'Shell:'}</span>
+                        <select
+                            value={selected ?? ''}
+                            onChange={(e) => setSelected(e.target.value)}
+                            style={{
+                                background: '#2b2b2b',
+                                color: '#ddd',
+                                border: '1px solid #555',
+                                borderRadius: 4,
+                                padding: '1px 4px',
+                            }}
+                        >
+                            {shells.map((s) => (
+                                <option
+                                    key={s.name}
+                                    value={s.name}
+                                >
+                                    {s.name}
+                                </option>
+                            ))}
+                        </select>
+                    </label>
+                )}
             </div>
             <div
                 ref={containerRef}

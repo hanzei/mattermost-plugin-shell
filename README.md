@@ -32,9 +32,17 @@ Click the terminal button in the channel header to open it.
 
 - Restricted to **system administrators** (enforced before the WebSocket upgrade).
 - Spawns an interactive shell with a PTY on the host, as the Mattermost server
-  process user. Prefers `bash -i` (for tab completion, history, and color),
-  falling back to `sh -i`. A generated rc file enables a colored prompt,
-  `ls`/`grep` color aliases, dircolors, and bash programmable completion.
+  process user.
+- **Per-user shell selection:** a dropdown in the panel header lists the shells
+  detected on the host (`bash`, `zsh`, `fish`, `sh`, `dash`, `ksh`, `tcsh`). The
+  choice is saved per user in the KV store and reused on the next open. The
+  detected set is also the allowlist — a requested shell that isn't detected is
+  ignored and the default (bash, then sh) is used, so no client-supplied path is
+  ever executed.
+- A generated rc file enables a colored prompt, `ls`/`grep` color aliases,
+  dircolors, and bash programmable completion for `bash` (via `--rcfile`) and
+  POSIX shells (via `$ENV`). Other shells (`zsh`, `fish`, `tcsh`) run
+  interactively and use the host user's own dotfiles.
 - Transport is a WebSocket through the plugin's HTTP path
   (`/plugins/com.mattermost.plugin-cmd/api/v1/terminal`), using the framework's
   connection-hijack support. Output is streamed as binary frames; keystrokes and

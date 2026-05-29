@@ -14,10 +14,92 @@ import (
 	"github.com/mattermost/mattermost/server/public/model"
 )
 
-// fallbackShell is used when bash is not on the host. MVP: runs as the Mattermost
-// server process user. Hardening (dedicated user / container / nsjail) is a
-// deliberate follow-up, see README.
-const fallbackShell = "/bin/sh"
+// candidateShells are probed on the host (via PATH) to build the set of
+// selectable shells. The detected set doubles as the allowlist: only a shell in
+// this set can ever be launched, so no free-form path from the client reaches
+// exec. Order matters — earlier entries win the default and survive dedup.
+//
+// MVP note: shells run as the Mattermost server process user. Hardening
+// (dedicated user / container / nsjail) is a deliberate follow-up, see README.
+var candidateShells = []string{"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh"}
+
+// shellInfo is a detected, launchable shell.
+type shellInfo struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
+// detectShells returns the candidate shells present on the host, deduped by their
+// resolved binary (so e.g. /bin/sh -> dash doesn't appear twice).
+func detectShells() []shellInfo {
+	var out []shellInfo
+	seen := make(map[string]bool)
+	for _, name := range candidateShells {
+		path, err := exec.LookPath(name)
+		if err != nil {
+			continue
+		}
+		resolved := path
+		if r, err := filepath.EvalSymlinks(path); err == nil {
+			resolved = r
+		}
+		if seen[resolved] {
+			continue
+		}
+		seen[resolved] = true
+		out = append(out, shellInfo{Name: name, Path: path})
+	}
+	return out
+}
+
+// resolveShell decides which detected shell to launch. A valid requested name
+// wins (the caller persists it); otherwise the saved per-user preference, if
+// still present on the host; otherwise a default (bash, then sh, then the first
+// detected). Returns false only when no shells were detected at all. This is the
+// security-relevant gate — an unknown/invalid name never selects a shell, so it
+// can never be executed.
+func resolveShell(requested, savedPref string, detected []shellInfo) (shellInfo, bool) {
+	if len(detected) == 0 {
+		return shellInfo{}, false
+	}
+	byName := func(name string) (shellInfo, bool) {
+		for _, s := range detected {
+			if s.Name == name {
+				return s, true
+			}
+		}
+		return shellInfo{}, false
+	}
+
+	if requested != "" {
+		if s, ok := byName(requested); ok {
+			return s, true
+		}
+	}
+	if savedPref != "" {
+		if s, ok := byName(savedPref); ok {
+			return s, true
+		}
+	}
+	for _, def := range []string{"bash", "sh"} {
+		if s, ok := byName(def); ok {
+			return s, true
+		}
+	}
+	return detected[0], true
+}
+
+// shellFamily groups shells by how their rc / color setup is injected.
+func shellFamily(name string) string {
+	switch name {
+	case "bash":
+		return "bash"
+	case "sh", "dash", "ash", "ksh":
+		return "posix" // honor $ENV for interactive shells
+	default:
+		return "other" // zsh, fish, tcsh — rely on the user's own dotfiles
+	}
+}
 
 // terminalRC is sourced by interactive shells started for the terminal. It turns
 // on color (prompt, ls/grep aliases, dircolors) and, under bash, programmable
@@ -117,6 +199,18 @@ func (p *Plugin) handleTerminal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve the shell before upgrading so we can fail cleanly if none exist.
+	requested := r.URL.Query().Get("shell")
+	shell, ok := resolveShell(requested, p.getShellPref(userID), detectShells())
+	if !ok {
+		http.Error(w, "No supported shell found on the host", http.StatusInternalServerError)
+		return
+	}
+	// Persist only an explicit, valid selection (so the dropdown sticks).
+	if requested != "" && requested == shell.Name {
+		p.setShellPref(userID, shell.Name)
+	}
+
 	upgrader := websocket.Upgrader{
 		CheckOrigin: p.checkTerminalOrigin,
 	}
@@ -129,7 +223,7 @@ func (p *Plugin) handleTerminal(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	cmd := p.terminalCmd()
+	cmd := p.terminalCmd(shell)
 
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
@@ -142,7 +236,7 @@ func (p *Plugin) handleTerminal(w http.ResponseWriter, r *http.Request) {
 	p.terminals.add(session)
 	defer p.terminals.remove(session.id)
 
-	p.API.LogInfo("Terminal session started", "user_id", userID, "session_id", session.id)
+	p.API.LogInfo("Terminal session started", "user_id", userID, "session_id", session.id, "shell", shell.Name)
 	defer p.API.LogInfo("Terminal session ended", "user_id", userID, "session_id", session.id)
 
 	// PTY output -> websocket. When the shell exits, the read errors and we close
@@ -186,40 +280,83 @@ func (p *Plugin) handleTerminal(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// terminalCmd builds the shell command for a session. It prefers an interactive
-// bash (for tab completion, history, and color), falling back to an interactive
-// POSIX sh. The rcfile enabling color/completion is sourced via --rcfile (bash)
-// or $ENV (sh). Color-forcing env vars help tools that auto-detect a TTY.
-func (p *Plugin) terminalCmd() *exec.Cmd {
+// terminalCmd builds the interactive command for the chosen shell. The shell
+// path comes from detectShells (never from client input), so it is trusted. rc
+// injection is dispatched by shell family: bash via --rcfile, POSIX shells via
+// $ENV; other shells (zsh, fish, tcsh) run interactively and rely on the host
+// user's own dotfiles. Color-forcing env vars help tools that auto-detect a TTY.
+func (p *Plugin) terminalCmd(shell shellInfo) *exec.Cmd {
 	env := append(os.Environ(),
 		"TERM=xterm-256color",
 		"COLORTERM=truecolor",
 		"CLICOLOR=1",
 		"CLICOLOR_FORCE=1",
 	)
-	rc := p.writeTerminalRC()
 
-	if bashPath, err := exec.LookPath("bash"); err == nil {
+	var cmd *exec.Cmd
+	switch shellFamily(shell.Name) {
+	case "bash":
 		args := []string{"-i"}
-		if rc != "" {
+		if rc := p.writeTerminalRC(); rc != "" {
 			args = []string{"--rcfile", rc, "-i"}
 		}
-		// #nosec G204 -- an interactive host shell is the purpose of this
-		// endpoint; access is gated to system admins before the upgrade.
-		cmd := exec.Command(bashPath, args...)
-		cmd.Env = env
-		return cmd
+		// #nosec G204 -- shell.Path is a host-detected shell from the allowlist,
+		// not client input; an interactive host shell is this endpoint's purpose
+		// and access is gated to system admins before the upgrade.
+		cmd = exec.Command(shell.Path, args...)
+	case "posix":
+		if rc := p.writeTerminalRC(); rc != "" {
+			env = append(env, "ENV="+rc)
+		}
+		// #nosec G204 -- see above.
+		cmd = exec.Command(shell.Path, "-i")
+	default:
+		// #nosec G204 -- see above.
+		cmd = exec.Command(shell.Path, "-i")
 	}
 
-	// No bash: fall back to sh. Interactive enables line editing where the shell
-	// supports it; note dash and other minimal /bin/sh lack tab completion.
-	if rc != "" {
-		env = append(env, "ENV="+rc)
-	}
-	// #nosec G204 -- see above; admin-gated interactive shell.
-	cmd := exec.Command(fallbackShell, "-i")
 	cmd.Env = env
 	return cmd
+}
+
+// getShellPref returns the user's saved shell name, or "" if none/unreadable.
+func (p *Plugin) getShellPref(userID string) string {
+	var name string
+	if err := p.client.KV.Get("shell_pref_"+userID, &name); err != nil {
+		p.API.LogWarn("Failed to read shell preference", "user_id", userID, "error", err.Error())
+		return ""
+	}
+	return name
+}
+
+// setShellPref persists the user's shell selection (best-effort).
+func (p *Plugin) setShellPref(userID, name string) {
+	if _, err := p.client.KV.Set("shell_pref_"+userID, name); err != nil {
+		p.API.LogWarn("Failed to save shell preference", "user_id", userID, "error", err.Error())
+	}
+}
+
+// handleShells lists the shells available on the host and the caller's current
+// selection, for populating the picker. System-admin only, like the terminal.
+func (p *Plugin) handleShells(w http.ResponseWriter, r *http.Request) {
+	userID := r.Header.Get("Mattermost-User-ID")
+	if !p.client.User.HasPermissionTo(userID, model.PermissionManageSystem) {
+		http.Error(w, "Forbidden: system administrator required", http.StatusForbidden)
+		return
+	}
+
+	detected := detectShells()
+	selected, _ := resolveShell("", p.getShellPref(userID), detected)
+
+	resp := struct {
+		Shells   []shellInfo `json:"shells"`
+		Selected string      `json:"selected"`
+	}{Shells: detected, Selected: selected.Name}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		p.API.LogError("Failed to encode shells response", "error", err.Error())
+	}
 }
 
 // writeTerminalRC writes the shared rc file and returns its path, or "" if it
