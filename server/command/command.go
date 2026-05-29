@@ -45,41 +45,63 @@ const execTimeout = 30 * time.Second
 
 // Register all your slash commands in the NewCommandHandler function.
 func NewCommandHandler(client *pluginapi.Client) Command {
-	err := client.SlashCommand.Register(&model.Command{
-		Trigger:          helloCommandTrigger,
-		AutoComplete:     true,
-		AutoCompleteDesc: "Say hello to someone",
-		AutoCompleteHint: "[@username]",
-		AutocompleteData: model.NewAutocompleteData(helloCommandTrigger, "[@username]", "Username to say hello to"),
-	})
-	if err != nil {
-		client.Log.Error("Failed to register command", "error", err)
-	}
-
-	err = client.SlashCommand.Register(&model.Command{
-		Trigger:          execCommandTrigger,
-		AutoComplete:     true,
-		AutoCompleteDesc: "Run a shell command on the host machine",
-		AutoCompleteHint: "[command]",
-		AutocompleteData: model.NewAutocompleteData(execCommandTrigger, "[command]", "Shell command to run on the host"),
-	})
-	if err != nil {
-		client.Log.Error("Failed to register command", "error", err)
-	}
-
-	err = client.SlashCommand.Register(&model.Command{
-		Trigger:          inspectCommandTrigger,
-		AutoComplete:     true,
-		AutoCompleteDesc: "Inspect the plugin's container without a shell",
-		AutoCompleteHint: "[env|bins|info|cat <path>]",
-		AutocompleteData: model.NewAutocompleteData(inspectCommandTrigger, "[env|bins|info|cat <path>]", "Introspect the container using pure Go (no shell required)"),
-	})
-	if err != nil {
-		client.Log.Error("Failed to register command", "error", err)
+	for _, command := range []*model.Command{
+		helloCommand(),
+		execCommand(),
+		inspectCommand(),
+	} {
+		if err := client.SlashCommand.Register(command); err != nil {
+			client.Log.Error("Failed to register command", "trigger", command.Trigger, "error", err)
+		}
 	}
 
 	return &Handler{
 		client: client,
+	}
+}
+
+func helloCommand() *model.Command {
+	data := model.NewAutocompleteData(helloCommandTrigger, "[@username]", "Say hello to someone")
+	data.AddTextArgument("Username to say hello to", "[@username]", "")
+
+	return &model.Command{
+		Trigger:          helloCommandTrigger,
+		AutoComplete:     true,
+		AutoCompleteDesc: "Say hello to someone",
+		AutoCompleteHint: "[@username]",
+		AutocompleteData: data,
+	}
+}
+
+func execCommand() *model.Command {
+	data := model.NewAutocompleteData(execCommandTrigger, "[command]", "Run a shell command on the host machine")
+	data.AddTextArgument("Shell command to run on the host, e.g. uname -a", "[command]", "")
+
+	return &model.Command{
+		Trigger:          execCommandTrigger,
+		AutoComplete:     true,
+		AutoCompleteDesc: "Run a shell command on the host machine",
+		AutoCompleteHint: "[command]",
+		AutocompleteData: data,
+	}
+}
+
+func inspectCommand() *model.Command {
+	data := model.NewAutocompleteData(inspectCommandTrigger, "[subcommand]", "Introspect the container using pure Go (no shell required)")
+	data.AddCommand(model.NewAutocompleteData("info", "", "Show Go runtime and OS info (default)"))
+	data.AddCommand(model.NewAutocompleteData("env", "", "Show the container's environment variables"))
+	data.AddCommand(model.NewAutocompleteData("bins", "", "List executables in common bin directories"))
+
+	cat := model.NewAutocompleteData("cat", "<path>", "Read a file, e.g. /etc/os-release or /proc/1/environ")
+	cat.AddTextArgument("Absolute path of the file to read", "<path>", "")
+	data.AddCommand(cat)
+
+	return &model.Command{
+		Trigger:          inspectCommandTrigger,
+		AutoComplete:     true,
+		AutoCompleteDesc: "Inspect the plugin's container without a shell",
+		AutoCompleteHint: "[info|env|bins|cat <path>]",
+		AutocompleteData: data,
 	}
 }
 
