@@ -4,7 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -20,10 +24,20 @@ type Command interface {
 	Handle(args *model.CommandArgs) (*model.CommandResponse, error)
 	executeHelloCommand(args *model.CommandArgs) *model.CommandResponse
 	executeExecCommand(args *model.CommandArgs) *model.CommandResponse
+	executeInspectCommand(args *model.CommandArgs) *model.CommandResponse
 }
 
-const helloCommandTrigger = "hello"
-const execCommandTrigger = "exec"
+const (
+	helloCommandTrigger   = "hello"
+	execCommandTrigger    = "exec"
+	inspectCommandTrigger = "inspect"
+)
+
+// inspectBinDirs are scanned to discover available executables. We use a fixed
+// list rather than $PATH on purpose: a minimal container often has an empty or
+// near-empty $PATH (the very condition that makes /exec fail), so walking $PATH
+// would report nothing precisely when discovery matters most.
+var inspectBinDirs = []string{"/bin", "/usr/bin", "/sbin", "/usr/sbin", "/usr/local/bin"}
 
 // execTimeout caps how long a command may run so a hung process doesn't block
 // the plugin's RPC connection to the server.
@@ -53,6 +67,17 @@ func NewCommandHandler(client *pluginapi.Client) Command {
 		client.Log.Error("Failed to register command", "error", err)
 	}
 
+	err = client.SlashCommand.Register(&model.Command{
+		Trigger:          inspectCommandTrigger,
+		AutoComplete:     true,
+		AutoCompleteDesc: "Inspect the plugin's container without a shell",
+		AutoCompleteHint: "[env|bins|info|cat <path>]",
+		AutocompleteData: model.NewAutocompleteData(inspectCommandTrigger, "[env|bins|info|cat <path>]", "Introspect the container using pure Go (no shell required)"),
+	})
+	if err != nil {
+		client.Log.Error("Failed to register command", "error", err)
+	}
+
 	return &Handler{
 		client: client,
 	}
@@ -73,6 +98,8 @@ func (c *Handler) Handle(args *model.CommandArgs) (*model.CommandResponse, error
 		return c.executeHelloCommand(args), nil
 	case execCommandTrigger:
 		return c.executeExecCommand(args), nil
+	case inspectCommandTrigger:
+		return c.executeInspectCommand(args), nil
 	default:
 		return &model.CommandResponse{
 			ResponseType: model.CommandResponseTypeEphemeral,
@@ -122,6 +149,8 @@ func (c *Handler) executeExecCommand(args *model.CommandArgs) *model.CommandResp
 	// Use an absolute path: the plugin process may run with an empty or minimal
 	// $PATH, so a bare "sh" can fail to resolve ("executable file not found in
 	// $PATH"). /bin/sh exists on Linux and macOS hosts.
+	// #nosec G204 -- running an arbitrary host command is the whole point of
+	// /exec; access is gated to system admins above.
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", cmdLine)
 
 	var combined bytes.Buffer
@@ -162,4 +191,142 @@ func (c *Handler) executeExecCommand(args *model.CommandArgs) *model.CommandResp
 		ResponseType: model.CommandResponseTypeEphemeral,
 		Text:         b.String(),
 	}
+}
+
+// executeInspectCommand reports facts about the container the plugin runs in
+// using only the Go standard library. Unlike /exec it never spawns a process,
+// so it works in shell-less images (distroless, scratch) where /bin/sh and even
+// utilities like env or ls are absent.
+func (c *Handler) executeInspectCommand(args *model.CommandArgs) *model.CommandResponse {
+	if !c.client.User.HasPermissionTo(args.UserId, model.PermissionManageSystem) {
+		return &model.CommandResponse{
+			ResponseType: model.CommandResponseTypeEphemeral,
+			Text:         ":no_entry: This command is restricted to system administrators.",
+		}
+	}
+
+	fields := strings.Fields(args.Command)
+	sub := "info"
+	if len(fields) >= 2 {
+		sub = fields[1]
+	}
+
+	var out string
+	switch sub {
+	case "env":
+		out = inspectEnv()
+	case "bins":
+		out = inspectBins()
+	case "info":
+		out = inspectInfo()
+	case "cat":
+		if len(fields) < 3 {
+			out = "Usage: `/inspect cat <path>` (e.g. `/inspect cat /etc/os-release` or `/inspect cat /proc/1/environ`)"
+			break
+		}
+		out = inspectCat(fields[2])
+	default:
+		out = fmt.Sprintf("Unknown subcommand %q. Try `env`, `bins`, `info`, or `cat <path>`.", sub)
+	}
+
+	c.client.Log.Info("Inspected container", "user_id", args.UserId, "subcommand", sub)
+
+	return &model.CommandResponse{
+		ResponseType: model.CommandResponseTypeEphemeral,
+		Text:         out,
+	}
+}
+
+// inspectEnv returns the process environment. Because the plugin runs as a
+// subprocess of the Mattermost server, this is the server container's
+// environment. (For PID 1's environment specifically, use `cat /proc/1/environ`.)
+func inspectEnv() string {
+	env := os.Environ()
+	sort.Strings(env)
+	if len(env) == 0 {
+		return "_(empty environment)_"
+	}
+	return "**Environment** (" + fmt.Sprintf("%d", len(env)) + " vars)\n```\n" + strings.Join(env, "\n") + "\n```"
+}
+
+// inspectBins lists executables found in a fixed set of common bin directories.
+func inspectBins() string {
+	var b strings.Builder
+	b.WriteString("**Executables in common bin directories**\n")
+	found := false
+	for _, dir := range inspectBinDirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			fmt.Fprintf(&b, "\n`%s` — _%s_\n", dir, err)
+			continue
+		}
+		var names []string
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			names = append(names, e.Name())
+		}
+		sort.Strings(names)
+		fmt.Fprintf(&b, "\n`%s` (%d):\n", dir, len(names))
+		if len(names) == 0 {
+			b.WriteString("_(empty)_\n")
+			continue
+		}
+		found = true
+		b.WriteString("```\n")
+		b.WriteString(strings.Join(names, " "))
+		b.WriteString("\n```\n")
+	}
+	if !found {
+		b.WriteString("\n_No executables found — this looks like a scratch/distroless image. Use `/inspect cat <path>` and `/inspect env` to introspect further._")
+	}
+	return b.String()
+}
+
+// inspectInfo reports Go runtime and basic OS facts about the container.
+func inspectInfo() string {
+	var b strings.Builder
+	b.WriteString("**Container / runtime info**\n```\n")
+	hostname, _ := os.Hostname()
+	cwd, _ := os.Getwd()
+	exe, _ := os.Executable()
+	fmt.Fprintf(&b, "go version : %s\n", runtime.Version())
+	fmt.Fprintf(&b, "GOOS/GOARCH: %s/%s\n", runtime.GOOS, runtime.GOARCH)
+	fmt.Fprintf(&b, "NumCPU     : %d\n", runtime.NumCPU())
+	fmt.Fprintf(&b, "hostname   : %s\n", hostname)
+	fmt.Fprintf(&b, "uid/gid    : %d/%d\n", os.Getuid(), os.Getgid())
+	fmt.Fprintf(&b, "pid        : %d\n", os.Getpid())
+	fmt.Fprintf(&b, "cwd        : %s\n", cwd)
+	fmt.Fprintf(&b, "executable : %s\n", exe)
+	fmt.Fprintf(&b, "PATH       : %s\n", os.Getenv("PATH"))
+	b.WriteString("```")
+	return b.String()
+}
+
+// inspectCat reads a file with the Go standard library (no `cat` binary needed).
+// NUL bytes are rendered as newlines so /proc/*/environ files read cleanly.
+func inspectCat(path string) string {
+	path = filepath.Clean(path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Sprintf(":x: cannot read `%s`: %s", path, err)
+	}
+	const maxBytes = 16 * 1024
+	truncated := false
+	if len(data) > maxBytes {
+		data = data[:maxBytes]
+		truncated = true
+	}
+	content := strings.ReplaceAll(string(data), "\x00", "\n")
+	var b strings.Builder
+	fmt.Fprintf(&b, "**`%s`**\n```\n%s", path, content)
+	if !strings.HasSuffix(content, "\n") {
+		b.WriteString("\n")
+	}
+	b.WriteString("```")
+	if truncated {
+		b.WriteString("\n_(truncated to 16 KiB)_")
+	}
+	return b.String()
 }
