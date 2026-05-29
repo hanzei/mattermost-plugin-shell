@@ -20,7 +20,6 @@ Click the terminal button in the channel header to open it.
 
 ![Interactive host terminal in the right-hand sidebar, showing colored output](docs/terminal.png)
 
-- Restricted to **system administrators** (enforced before the WebSocket upgrade).
 - Spawns an interactive shell with a PTY on the host, as the Mattermost server
   process user.
 - **Per-user shell selection:** a dropdown in the panel header lists the shells
@@ -40,17 +39,6 @@ Click the terminal button in the channel header to open it.
   connection-hijack support. Output is streamed as binary frames; keystrokes and
   resize events are sent as JSON control messages.
 - Live sessions are tracked and killed when the plugin is deactivated.
-
-> This is an MVP: there is **no session isolation, recording, or resource
-> limiting** yet. See the production checklist below before considering real use.
-
-### Production hardening (not yet implemented)
-
-The terminal is functionally complete but deliberately unhardened. Before any
-non-local use it needs: process isolation (dedicated low-privilege user, or a
-container/nsjail sandbox instead of the server process user), full session audit
-logging / recording, idle and max-duration timeouts, and a concurrent-session
-cap.
 
 ## Slash commands
 
