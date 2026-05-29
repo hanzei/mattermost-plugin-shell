@@ -22,13 +22,11 @@ type Handler struct {
 
 type Command interface {
 	Handle(args *model.CommandArgs) (*model.CommandResponse, error)
-	executeHelloCommand(args *model.CommandArgs) *model.CommandResponse
 	executeExecCommand(args *model.CommandArgs) *model.CommandResponse
 	executeInspectCommand(args *model.CommandArgs) *model.CommandResponse
 }
 
 const (
-	helloCommandTrigger   = "hello"
 	execCommandTrigger    = "exec"
 	inspectCommandTrigger = "inspect"
 )
@@ -46,7 +44,6 @@ const execTimeout = 30 * time.Second
 // Register all your slash commands in the NewCommandHandler function.
 func NewCommandHandler(client *pluginapi.Client) Command {
 	for _, command := range []*model.Command{
-		helloCommand(),
 		execCommand(),
 		inspectCommand(),
 	} {
@@ -57,19 +54,6 @@ func NewCommandHandler(client *pluginapi.Client) Command {
 
 	return &Handler{
 		client: client,
-	}
-}
-
-func helloCommand() *model.Command {
-	data := model.NewAutocompleteData(helloCommandTrigger, "[@username]", "Say hello to someone")
-	data.AddTextArgument("Username to say hello to", "[@username]", "")
-
-	return &model.Command{
-		Trigger:          helloCommandTrigger,
-		AutoComplete:     true,
-		AutoCompleteDesc: "Say hello to someone",
-		AutoCompleteHint: "[@username]",
-		AutocompleteData: data,
 	}
 }
 
@@ -116,8 +100,6 @@ func (c *Handler) Handle(args *model.CommandArgs) (*model.CommandResponse, error
 	}
 	trigger := strings.TrimPrefix(fields[0], "/")
 	switch trigger {
-	case helloCommandTrigger:
-		return c.executeHelloCommand(args), nil
 	case execCommandTrigger:
 		return c.executeExecCommand(args), nil
 	case inspectCommandTrigger:
@@ -127,19 +109,6 @@ func (c *Handler) Handle(args *model.CommandArgs) (*model.CommandResponse, error
 			ResponseType: model.CommandResponseTypeEphemeral,
 			Text:         fmt.Sprintf("Unknown command: %s", args.Command),
 		}, nil
-	}
-}
-
-func (c *Handler) executeHelloCommand(args *model.CommandArgs) *model.CommandResponse {
-	if len(strings.Fields(args.Command)) < 2 {
-		return &model.CommandResponse{
-			ResponseType: model.CommandResponseTypeEphemeral,
-			Text:         "Please specify a username",
-		}
-	}
-	username := strings.Fields(args.Command)[1]
-	return &model.CommandResponse{
-		Text: "Hello, " + username,
 	}
 }
 

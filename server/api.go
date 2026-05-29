@@ -16,8 +16,6 @@ func (p *Plugin) initRouter() *mux.Router {
 
 	apiRouter := router.PathPrefix("/api/v1").Subrouter()
 
-	apiRouter.HandleFunc("/hello", p.HelloWorld).Methods(http.MethodGet)
-
 	// Interactive host terminal (system-admin only; enforced in the handler).
 	apiRouter.HandleFunc("/terminal", p.handleTerminal).Methods(http.MethodGet)
 
@@ -27,8 +25,8 @@ func (p *Plugin) initRouter() *mux.Router {
 	return router
 }
 
-// ServeHTTP demonstrates a plugin that handles HTTP requests by greeting the world.
-// The root URL is currently <siteUrl>/plugins/com.mattermost.plugin-starter-template/api/v1/. Replace com.mattermost.plugin-starter-template with the plugin ID.
+// ServeHTTP routes plugin HTTP requests. The root URL is
+// <siteUrl>/plugins/com.mattermost.plugin-cmd/api/v1/.
 func (p *Plugin) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Request) {
 	p.router.ServeHTTP(w, r)
 }
@@ -43,11 +41,4 @@ func (p *Plugin) MattermostAuthorizationRequired(next http.Handler) http.Handler
 
 		next.ServeHTTP(w, r)
 	})
-}
-
-func (p *Plugin) HelloWorld(w http.ResponseWriter, r *http.Request) {
-	if _, err := w.Write([]byte("Hello, world!")); err != nil {
-		p.API.LogError("Failed to write response", "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-	}
 }

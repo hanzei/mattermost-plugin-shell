@@ -26,21 +26,6 @@ func setupTest() *env {
 	}
 }
 
-func TestHelloCommand(t *testing.T) {
-	assert := assert.New(t)
-	env := setupTest()
-
-	env.api.On("RegisterCommand", mock.AnythingOfType("*model.Command")).Return(nil)
-	cmdHandler := NewCommandHandler(env.client)
-
-	args := &model.CommandArgs{
-		Command: "/hello world",
-	}
-	response, err := cmdHandler.Handle(args)
-	assert.Nil(err)
-	assert.Equal("Hello, world", response.Text)
-}
-
 func TestInspectCommand(t *testing.T) {
 	assert := assert.New(t)
 	env := setupTest()
