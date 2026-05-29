@@ -1,9 +1,9 @@
 {
-    "id": "com.mattermost.plugin-starter-template",
-    "name": "Plugin Starter Template",
-    "description": "This plugin serves as a starting point for writing a Mattermost plugin.",
-    "homepage_url": "https://github.com/mattermost/mattermost-plugin-starter-template",
-    "support_url": "https://github.com/mattermost/mattermost-plugin-starter-template/issues",
+    "id": "com.mattermost.plugin-cmd",
+    "name": "Command Executor",
+    "description": "Adds an /exec slash command that runs shell commands on the host machine. For local development only — do not use in production.",
+    "homepage_url": "https://github.com/hanzei/mattermost-plugin-cmd",
+    "support_url": "https://github.com/hanzei/mattermost-plugin-cmd/issues",
     "icon_path": "assets/starter-template-icon.svg",
     "min_server_version": "6.2.1",
     "server": {
