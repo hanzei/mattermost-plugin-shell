@@ -31,7 +31,10 @@ The plugin also provides a full interactive terminal in the right-hand sidebar.
 Click the terminal button in the channel header to open it.
 
 - Restricted to **system administrators** (enforced before the WebSocket upgrade).
-- Spawns `/bin/sh` with a PTY on the host, as the Mattermost server process user.
+- Spawns an interactive shell with a PTY on the host, as the Mattermost server
+  process user. Prefers `bash -i` (for tab completion, history, and color),
+  falling back to `sh -i`. A generated rc file enables a colored prompt,
+  `ls`/`grep` color aliases, dircolors, and bash programmable completion.
 - Transport is a WebSocket through the plugin's HTTP path
   (`/plugins/com.mattermost.plugin-cmd/api/v1/terminal`), using the framework's
   connection-hijack support. Output is streamed as binary frames; keystrokes and
