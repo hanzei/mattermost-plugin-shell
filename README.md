@@ -66,11 +66,15 @@ than **30 seconds**.
 /exec df -h | grep /dev/sda1
 ```
 
+![/exec output posted back as an ephemeral message](docs/exec.png)
+
 `/inspect [info|env|bins|cat <path>]` introspects the host/container using pure
 Go — no shell spawned — so it works even in shell-less images (distroless,
 scratch). `info` reports runtime/OS facts, `env` the environment, `bins` the
 executables in common bin directories, and `cat` reads a file (e.g.
 `/etc/os-release`).
+
+![/inspect info output](docs/inspect.png)
 
 ## Development
 
