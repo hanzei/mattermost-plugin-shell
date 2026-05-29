@@ -68,6 +68,10 @@ than **30 seconds**.
 
 ![/exec output posted back as an ephemeral message](docs/exec.png)
 
+The status line reflects the command's exit code, so failures are obvious:
+
+![/exec showing a non-zero exit status](docs/exec-error.png)
+
 `/inspect [info|env|bins|cat <path>]` introspects the host/container using pure
 Go — no shell spawned — so it works even in shell-less images (distroless,
 scratch). `info` reports runtime/OS facts, `env` the environment, `bins` the
