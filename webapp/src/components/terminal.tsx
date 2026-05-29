@@ -187,7 +187,7 @@ const HostTerminal: React.FC = () => {
                     borderBottom: '1px solid #333',
                 }}
             >
-                <span>{'Host terminal · '}{status}</span>
+                <span>{'Shell · '}{status}</span>
                 {shells.length > 0 && (
                     <label style={{display: 'flex', alignItems: 'center', gap: 4}}>
                         <span>{'Shell:'}</span>

@@ -26,7 +26,7 @@ func (p *Plugin) initRouter() *mux.Router {
 }
 
 // ServeHTTP routes plugin HTTP requests. The root URL is
-// <siteUrl>/plugins/com.mattermost.plugin-cmd/api/v1/.
+// <siteUrl>/plugins/com.hanzei.shell/api/v1/.
 func (p *Plugin) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Request) {
 	p.router.ServeHTTP(w, r)
 }

@@ -61,4 +61,4 @@ formatters:
           replacement: any
     goimports:
       local-prefixes:
-        - github.com/hanzei/mattermost-plugin-cmd
+        - github.com/hanzei/mattermost-plugin-shell

@@ -1,4 +1,4 @@
-module github.com/hanzei/mattermost-plugin-cmd
+module github.com/hanzei/mattermost-plugin-shell
 
 go 1.25
 

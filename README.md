@@ -1,4 +1,4 @@
-# Command Executor
+# Shell
 
 > ⚠️ **DANGER — DO NOT USE IN PRODUCTION** ⚠️
 >
@@ -48,7 +48,7 @@ Click the terminal button in the channel header to open it.
   POSIX shells (via `$ENV`). Other shells (`zsh`, `fish`, `tcsh`) run
   interactively and use the host user's own dotfiles.
 - Transport is a WebSocket through the plugin's HTTP path
-  (`/plugins/com.mattermost.plugin-cmd/api/v1/terminal`), using the framework's
+  (`/plugins/com.hanzei.shell/api/v1/terminal`), using the framework's
   connection-hijack support. Output is streamed as binary frames; keystrokes and
   resize events are sent as JSON control messages.
 - Live sessions are tracked and killed when the plugin is deactivated.
@@ -74,7 +74,7 @@ Build the plugin bundle:
 make
 ```
 
-This produces `dist/com.mattermost.plugin-cmd-<version>.tar.gz`.
+This produces `dist/com.hanzei.shell-<version>.tar.gz`.
 
 ### Deploying to a local server
 

@@ -42,7 +42,7 @@ export default class Plugin {
         // @see https://developers.mattermost.com/extend/plugins/webapp/reference/
         const {toggleRHSPlugin, hideRHSPlugin} = registry.registerRightHandSidebarComponent(
             HostTerminal,
-            'Host Terminal',
+            'Shell',
         );
 
         // Let the terminal close the panel when its shell session ends.
@@ -51,8 +51,8 @@ export default class Plugin {
         registry.registerChannelHeaderButtonAction(
             <TerminalIcon/>,
             () => store.dispatch(toggleRHSPlugin),
-            'Host Terminal',
-            'Open an interactive host terminal (system admins only)',
+            'Shell',
+            'Open an interactive host shell (system admins only)',
         );
     }
 }

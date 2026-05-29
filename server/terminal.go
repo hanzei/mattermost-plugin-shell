@@ -106,7 +106,7 @@ func shellFamily(name string) string {
 // tab completion. It is written POSIX-first with bash-only bits guarded so it is
 // safe for both `bash --rcfile` and sh's $ENV.
 const terminalRC = `
-# Sourced by the Mattermost cmd plugin terminal for interactive shells.
+# Sourced by the Mattermost Shell plugin for interactive shells.
 [ -r /etc/profile ] && . /etc/profile
 if [ -n "$BASH_VERSION" ] && [ -r "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
 
@@ -363,7 +363,7 @@ func (p *Plugin) handleShells(w http.ResponseWriter, r *http.Request) {
 // could not be written (in which case the shell still runs, just without the
 // color/completion niceties).
 func (p *Plugin) writeTerminalRC() string {
-	path := filepath.Join(os.TempDir(), "mattermost-cmd-terminal.rc")
+	path := filepath.Join(os.TempDir(), "mattermost-shell-terminal.rc")
 	if err := os.WriteFile(path, []byte(terminalRC), 0o600); err != nil {
 		p.API.LogWarn("Failed to write terminal rc file; color/completion may be limited", "error", err.Error())
 		return ""
