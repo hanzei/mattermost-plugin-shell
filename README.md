@@ -28,8 +28,7 @@ combined stdout/stderr as an ephemeral message.
 ## Interactive terminal (RHS)
 
 The plugin also provides a full interactive terminal in the right-hand sidebar.
-Click the `>_` button in the channel header to open it; use the **Full screen**
-toggle in the panel header to expand it to the whole window.
+Click the terminal button in the channel header to open it.
 
 - Restricted to **system administrators** (enforced before the WebSocket upgrade).
 - Spawns `/bin/sh` with a PTY on the host, as the Mattermost server process user.

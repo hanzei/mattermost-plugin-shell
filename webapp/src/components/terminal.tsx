@@ -24,7 +24,6 @@ const HostTerminal: React.FC = () => {
     const fitRef = useRef<FitAddon | null>(null);
     const socketRef = useRef<WebSocket | null>(null);
 
-    const [fullscreen, setFullscreen] = useState(false);
     const [status, setStatus] = useState<'connecting' | 'open' | 'closed'>('connecting');
 
     const send = useCallback((msg: ClientMessage) => {
@@ -103,20 +102,7 @@ const HostTerminal: React.FC = () => {
         };
     }, [send, fitAndResize]);
 
-    // Refit after the container changes size (fullscreen toggle).
-    useEffect(() => {
-        const id = window.setTimeout(fitAndResize, 50);
-        return () => window.clearTimeout(id);
-    }, [fullscreen, fitAndResize]);
-
-    const wrapperStyle: React.CSSProperties = fullscreen ? {
-        position: 'fixed',
-        inset: 0,
-        zIndex: 9999,
-        display: 'flex',
-        flexDirection: 'column',
-        background: '#1e1e1e',
-    } : {
+    const wrapperStyle: React.CSSProperties = {
         display: 'flex',
         flexDirection: 'column',
         height: '100%',
@@ -127,9 +113,6 @@ const HostTerminal: React.FC = () => {
         <div style={wrapperStyle}>
             <div
                 style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
                     padding: '6px 10px',
                     color: '#ddd',
                     fontSize: 12,
@@ -137,20 +120,6 @@ const HostTerminal: React.FC = () => {
                 }}
             >
                 <span>{'Host terminal · '}{status}</span>
-                <button
-                    type='button'
-                    onClick={() => setFullscreen((v) => !v)}
-                    style={{
-                        background: 'transparent',
-                        border: '1px solid #555',
-                        borderRadius: 4,
-                        color: '#ddd',
-                        cursor: 'pointer',
-                        padding: '2px 8px',
-                    }}
-                >
-                    {fullscreen ? 'Exit full screen' : 'Full screen'}
-                </button>
             </div>
             <div
                 ref={containerRef}
