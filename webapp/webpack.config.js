@@ -2,12 +2,26 @@ const exec = require('child_process').exec;
 
 const path = require('path');
 
+const webpack = require('webpack');
+
 const PLUGIN_ID = require('../plugin.json').id;
 
 const NPM_TARGET = process.env.npm_lifecycle_event; //eslint-disable-line no-process-env
 const isDev = NPM_TARGET === 'debug' || NPM_TARGET === 'debug:watch';
 
 const plugins = [];
+
+// The `debug` build runs with `--mode=none`, which (unlike production mode) does
+// not define process.env.NODE_ENV. Bundled libraries such as @emotion read that
+// value at load time, so without this they throw "process is not defined" in the
+// browser and break plugin initialization. Production mode defines NODE_ENV
+// itself, so only add this for the dev build to avoid a conflicting definition.
+if (isDev) {
+    plugins.push(new webpack.DefinePlugin({
+        'process.env.NODE_ENV': JSON.stringify('development'),
+    }));
+}
+
 if (NPM_TARGET === 'build:watch' || NPM_TARGET === 'debug:watch') {
     plugins.push({
         apply: (compiler) => {
