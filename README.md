@@ -13,23 +13,9 @@
 A Mattermost plugin that gives system admins an interactive shell on the host —
 as a right-hand-sidebar terminal, plus `/exec` and `/inspect` slash commands.
 
-## Usage
+## Interactive terminal
 
-`/exec <command>` runs the command on the host via `sh -c` and returns the
-combined stdout/stderr as an ephemeral message.
-
-- Restricted to **system administrators**.
-- Commands run as the OS user of the Mattermost server process.
-- A command is killed if it runs longer than **30 seconds**.
-
-```
-/exec uname -a
-/exec df -h | grep /dev/sda1
-```
-
-## Interactive terminal (RHS)
-
-The plugin also provides a full interactive terminal in the right-hand sidebar.
+The marquee feature: a full interactive terminal in the right-hand sidebar.
 Click the terminal button in the channel header to open it.
 
 ![Interactive host terminal in the right-hand sidebar, showing colored output](docs/terminal.png)
@@ -65,6 +51,26 @@ non-local use it needs: process isolation (dedicated low-privilege user, or a
 container/nsjail sandbox instead of the server process user), full session audit
 logging / recording, idle and max-duration timeouts, and a concurrent-session
 cap.
+
+## Slash commands
+
+For one-off use without opening the terminal. Both are restricted to **system
+administrators** and run as the OS user of the Mattermost server process.
+
+`/exec <command>` runs the command on the host via `sh -c` and returns the
+combined stdout/stderr as an ephemeral message. It is killed if it runs longer
+than **30 seconds**.
+
+```
+/exec uname -a
+/exec df -h | grep /dev/sda1
+```
+
+`/inspect [info|env|bins|cat <path>]` introspects the host/container using pure
+Go — no shell spawned — so it works even in shell-less images (distroless,
+scratch). `info` reports runtime/OS facts, `env` the environment, `bins` the
+executables in common bin directories, and `cat` reads a file (e.g.
+`/etc/os-release`).
 
 ## Development
 
