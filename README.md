@@ -76,6 +76,14 @@ executables in common bin directories, and `cat` reads a file (e.g.
 
 ![/inspect info output](docs/inspect.png)
 
+`/inspect env` shows the process environment:
+
+![/inspect env output](docs/inspect-env.png)
+
+`/inspect bins` lists the executables found in common bin directories:
+
+![/inspect bins output](docs/inspect-bins.png)
+
 `/inspect cat <path>` reads a file directly — handy where no shell or `cat`
 binary exists:
 
