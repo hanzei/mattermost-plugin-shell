@@ -25,7 +25,7 @@ Click the terminal button in the channel header to open it.
   process user.
 - **Per-user shell selection:** a dropdown in the panel header lists the shells
   detected on the host (`bash`, `zsh`, `fish`, `sh`, `dash`, `ksh`, `tcsh`). The
-  choice is saved per user in the KV store and reused on the next open. The
+  choice is saved per user and reused on the next open. The
   detected set is also the allowlist — a requested shell that isn't detected is
   ignored and the default (bash, then sh) is used, so no client-supplied path is
   ever executed.
@@ -58,8 +58,7 @@ For one-off use without opening the terminal. Both are restricted to **system
 administrators** and run as the OS user of the Mattermost server process.
 
 `/exec <command>` runs the command on the host via `sh -c` and returns the
-combined stdout/stderr as an ephemeral message. It is killed if it runs longer
-than **30 seconds**.
+combined stdout/stderr as an ephemeral message.
 
 ```
 /exec uname -a
