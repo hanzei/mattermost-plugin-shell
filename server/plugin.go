@@ -32,6 +32,10 @@ type Plugin struct {
 	// router is the HTTP router for handling API requests.
 	router *mux.Router
 
+	// terminals tracks active interactive terminal sessions so they can be
+	// torn down on deactivation.
+	terminals *sessionManager
+
 	backgroundJob *cluster.Job
 
 	// configurationLock synchronizes access to the configuration.
@@ -52,6 +56,8 @@ func (p *Plugin) OnActivate() error {
 
 	p.router = p.initRouter()
 
+	p.terminals = newSessionManager()
+
 	job, err := cluster.Schedule(
 		p.API,
 		"BackgroundJob",
@@ -69,6 +75,9 @@ func (p *Plugin) OnActivate() error {
 
 // OnDeactivate is invoked when the plugin is deactivated.
 func (p *Plugin) OnDeactivate() error {
+	if p.terminals != nil {
+		p.terminals.closeAll()
+	}
 	if p.backgroundJob != nil {
 		if err := p.backgroundJob.Close(); err != nil {
 			p.API.LogError("Failed to close background job", "err", err)

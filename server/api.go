@@ -18,6 +18,9 @@ func (p *Plugin) initRouter() *mux.Router {
 
 	apiRouter.HandleFunc("/hello", p.HelloWorld).Methods(http.MethodGet)
 
+	// Interactive host terminal (system-admin only; enforced in the handler).
+	apiRouter.HandleFunc("/terminal", p.handleTerminal).Methods(http.MethodGet)
+
 	return router
 }
 

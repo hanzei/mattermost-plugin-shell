@@ -25,6 +25,31 @@ combined stdout/stderr as an ephemeral message.
 /exec df -h | grep /dev/sda1
 ```
 
+## Interactive terminal (RHS)
+
+The plugin also provides a full interactive terminal in the right-hand sidebar.
+Click the `>_` button in the channel header to open it; use the **Full screen**
+toggle in the panel header to expand it to the whole window.
+
+- Restricted to **system administrators** (enforced before the WebSocket upgrade).
+- Spawns `/bin/sh` with a PTY on the host, as the Mattermost server process user.
+- Transport is a WebSocket through the plugin's HTTP path
+  (`/plugins/com.mattermost.plugin-cmd/api/v1/terminal`), using the framework's
+  connection-hijack support. Output is streamed as binary frames; keystrokes and
+  resize events are sent as JSON control messages.
+- Live sessions are tracked and killed when the plugin is deactivated.
+
+> This is an MVP: there is **no session isolation, recording, or resource
+> limiting** yet. See the production checklist below before considering real use.
+
+### Production hardening (not yet implemented)
+
+The terminal is functionally complete but deliberately unhardened. Before any
+non-local use it needs: process isolation (dedicated low-privilege user, or a
+container/nsjail sandbox instead of the server process user), full session audit
+logging / recording, idle and max-duration timeouts, and a concurrent-session
+cap.
+
 ## Development
 
 Requires Go and Node (see `.nvmrc`; run `nvm i` to match).

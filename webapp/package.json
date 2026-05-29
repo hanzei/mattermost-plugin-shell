@@ -55,6 +55,8 @@
     "webpack-cli": "5.1.4"
   },
   "dependencies": {
+    "@xterm/addon-fit": "0.10.0",
+    "@xterm/xterm": "5.5.0",
     "core-js": "3.26.0",
     "mattermost-redux": "11.1.0",
     "react": "18.2.0",
