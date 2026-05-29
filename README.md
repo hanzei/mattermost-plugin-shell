@@ -30,6 +30,8 @@ combined stdout/stderr as an ephemeral message.
 The plugin also provides a full interactive terminal in the right-hand sidebar.
 Click the terminal button in the channel header to open it.
 
+![Interactive host terminal in the right-hand sidebar, showing colored output](docs/terminal.png)
+
 - Restricted to **system administrators** (enforced before the WebSocket upgrade).
 - Spawns an interactive shell with a PTY on the host, as the Mattermost server
   process user.
@@ -39,6 +41,8 @@ Click the terminal button in the channel header to open it.
   detected set is also the allowlist — a requested shell that isn't detected is
   ignored and the default (bash, then sh) is used, so no client-supplied path is
   ever executed.
+
+  ![Panel header with the per-user shell picker](docs/shell-picker.png)
 - A generated rc file enables a colored prompt, `ls`/`grep` color aliases,
   dircolors, and bash programmable completion for `bash` (via `--rcfile`) and
   POSIX shells (via `$ENV`). Other shells (`zsh`, `fish`, `tcsh`) run
