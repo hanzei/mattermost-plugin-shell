@@ -10,6 +10,7 @@ import type {GlobalState} from '@mattermost/types/store';
 import type {PluginRegistry} from 'types/mattermost-webapp';
 
 import HostTerminal from './components/terminal';
+import {setCloseRHS} from './rhs';
 
 // Terminal/console glyph. Uses currentColor so it inherits the channel-header
 // icon color in both the normal and active/hover states (a plain text span
@@ -39,10 +40,13 @@ const TerminalIcon: React.FC = () => (
 export default class Plugin {
     public async initialize(registry: PluginRegistry, store: Store<GlobalState>) {
         // @see https://developers.mattermost.com/extend/plugins/webapp/reference/
-        const {toggleRHSPlugin} = registry.registerRightHandSidebarComponent(
+        const {toggleRHSPlugin, hideRHSPlugin} = registry.registerRightHandSidebarComponent(
             HostTerminal,
             'Host Terminal',
         );
+
+        // Let the terminal close the panel when its shell session ends.
+        setCloseRHS(() => store.dispatch(hideRHSPlugin));
 
         registry.registerChannelHeaderButtonAction(
             <TerminalIcon/>,

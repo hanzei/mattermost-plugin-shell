@@ -7,6 +7,8 @@ import '@xterm/xterm/css/xterm.css';
 import manifest from 'manifest';
 import React, {useCallback, useEffect, useRef, useState} from 'react';
 
+import {closeRHS} from '../rhs';
+
 // Output flows backend -> browser as raw binary frames written straight to
 // xterm. Control flows browser -> backend as JSON envelopes.
 type ClientMessage =
@@ -126,11 +128,13 @@ const HostTerminal: React.FC = () => {
         term.reset();
         setStatus('connecting');
 
+        let opened = false;
         const socket = new WebSocket(terminalSocketURL(selected));
         socket.binaryType = 'arraybuffer';
         socketRef.current = socket;
 
         socket.onopen = () => {
+            opened = true;
             setStatus('open');
             send({type: 'resize', cols: term.cols, rows: term.rows});
             term.focus();
@@ -144,11 +148,19 @@ const HostTerminal: React.FC = () => {
         };
         socket.onclose = () => {
             setStatus('closed');
-            term.write('\r\n\x1b[31m[session closed]\x1b[0m\r\n');
+
+            // A session that actually started and then ended (e.g. the user
+            // typed `exit`) closes the panel. A socket that never opened is a
+            // connection problem worth surfacing instead.
+            if (opened) {
+                closeRHS();
+            } else {
+                term.write('\r\n\x1b[31m[could not connect to terminal]\x1b[0m\r\n');
+            }
         };
 
         return () => {
-            socket.onclose = null; // avoid the "[session closed]" notice on switch
+            socket.onclose = null; // don't close the panel when switching shells
             socket.close();
             socketRef.current = null;
         };
