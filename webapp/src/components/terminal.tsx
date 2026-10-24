@@ -7,6 +7,9 @@ import '@xterm/xterm/css/xterm.css';
 import manifest from 'manifest';
 import React, {useCallback, useEffect, useRef, useState} from 'react';
 
+import type {ClusterNode} from './cluster_nodes';
+import {pickNode, saveNode} from './cluster_nodes';
+
 import {closeRHS} from '../rhs';
 
 // Output flows backend -> browser as raw binary frames written straight to
@@ -19,15 +22,35 @@ type ShellInfo = {name: string; path: string};
 
 type ShellsResponse = {shells: ShellInfo[]; selected: string};
 
-function pluginURL(path: string): string {
-    return `/plugins/${manifest.id}/api/v1/${path}`;
+function pluginURL(path: string, params?: URLSearchParams): string {
+    const query = params && params.toString() ? `?${params.toString()}` : '';
+    return `/plugins/${manifest.id}/api/v1/${path}${query}`;
 }
 
-function terminalSocketURL(shell: string): string {
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const query = shell ? `?shell=${encodeURIComponent(shell)}` : '';
-    return `${proto}//${window.location.host}${pluginURL('terminal')}${query}`;
+// routeParams asks the plugin to run on a specific cluster node.
+function routeParams(node: string): URLSearchParams {
+    const params = new URLSearchParams();
+    if (node) {
+        params.set('node', node);
+    }
+    return params;
 }
+
+function terminalSocketURL(shell: string, params: URLSearchParams): string {
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    if (shell) {
+        params.set('shell', shell);
+    }
+    return `${proto}//${window.location.host}${pluginURL('terminal', params)}`;
+}
+
+const selectStyle: React.CSSProperties = {
+    background: '#2b2b2b',
+    color: '#ddd',
+    border: '1px solid #555',
+    borderRadius: 4,
+    padding: '1px 4px',
+};
 
 const HostTerminal: React.FC = () => {
     const containerRef = useRef<HTMLDivElement | null>(null);
@@ -35,8 +58,20 @@ const HostTerminal: React.FC = () => {
     const fitRef = useRef<FitAddon | null>(null);
     const socketRef = useRef<WebSocket | null>(null);
 
+    // Cluster nodes; empty unless the server is a cluster of more than one.
+    const [nodes, setNodes] = useState<ClusterNode[]>([]);
+
+    // The node picked: null until the node list has loaded, '' when there is no
+    // choice to make (a single server).
+    const [node, setNode] = useState<string | null>(null);
+
+    // The shells on the picked node. Empty while they load.
     const [shells, setShells] = useState<ShellInfo[]>([]);
-    const [selected, setSelected] = useState<string | null>(null);
+
+    // What the socket connects to. A shell name only means something on the
+    // node it was listed for, so the two change together: picking another node
+    // keeps the old session until that node's shells are known.
+    const [target, setTarget] = useState<{node: string; shell: string} | null>(null);
     const [status, setStatus] = useState<'connecting' | 'open' | 'closed'>('connecting');
 
     const send = useCallback((msg: ClientMessage) => {
@@ -93,21 +128,28 @@ const HostTerminal: React.FC = () => {
         };
     }, [send, fitAndResize]);
 
-    // Load the available shells and the saved selection.
+    // Load the connected cluster nodes. Single servers return an empty list.
     useEffect(() => {
         let cancelled = false;
-        fetch(pluginURL('shells'), {credentials: 'same-origin'}).
-            then((res) => res.json()).
-            then((data: ShellsResponse) => {
+        fetch(pluginURL('nodes'), {credentials: 'same-origin'}).
+            then((res) => (res.ok ? res.json() : [])).
+            then((data: ClusterNode[]) => {
                 if (cancelled) {
                     return;
                 }
-                setShells(data.shells || []);
-                setSelected(data.selected || '');
+                const sorted = (Array.isArray(data) ? data : []).
+                    sort((a, b) => a.hostname.localeCompare(b.hostname));
+                if (sorted.length < 2) {
+                    setNode('');
+                    return;
+                }
+                setNodes(sorted);
+                setNode(pickNode(sorted).id);
             }).
             catch(() => {
+                // The node picker stays hidden.
                 if (!cancelled) {
-                    setSelected(''); // fall back to the server default
+                    setNode('');
                 }
             });
         return () => {
@@ -115,9 +157,34 @@ const HostTerminal: React.FC = () => {
         };
     }, []);
 
-    // Connect the socket once a shell is known; reconnect when it changes.
+    // Load the available shells and the saved selection for the chosen node.
     useEffect(() => {
-        if (selected === null) {
+        if (node === null) {
+            return undefined; // wait for the node list
+        }
+        let cancelled = false;
+        fetch(pluginURL('shells', routeParams(node)), {credentials: 'same-origin'}).
+            then((res) => res.json()).
+            then((data: ShellsResponse) => {
+                if (cancelled) {
+                    return;
+                }
+                setShells(data.shells || []);
+                setTarget({node, shell: data.selected || ''});
+            }).
+            catch(() => {
+                if (!cancelled) {
+                    setTarget({node, shell: ''}); // fall back to the server default
+                }
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [node]);
+
+    // Connect the socket once a target is known; reconnect when it changes.
+    useEffect(() => {
+        if (target === null) {
             return undefined; // wait for the shells fetch to resolve
         }
         const term = termRef.current;
@@ -129,7 +196,8 @@ const HostTerminal: React.FC = () => {
         setStatus('connecting');
 
         let opened = false;
-        const socket = new WebSocket(terminalSocketURL(selected));
+        let failed = false;
+        const socket = new WebSocket(terminalSocketURL(target.shell, routeParams(target.node)));
         socket.binaryType = 'arraybuffer';
         socketRef.current = socket;
 
@@ -143,7 +211,10 @@ const HostTerminal: React.FC = () => {
             if (event.data instanceof ArrayBuffer) {
                 term.write(new Uint8Array(event.data));
             } else if (typeof event.data === 'string') {
-                term.write(event.data);
+                // Text frames are errors from the plugin, e.g. a node that
+                // could not start the shell.
+                term.write(`\r\n\x1b[31m[${event.data}]\x1b[0m\r\n`);
+                failed = true;
             }
         };
         socket.onclose = () => {
@@ -152,9 +223,9 @@ const HostTerminal: React.FC = () => {
             // A session that actually started and then ended (e.g. the user
             // typed `exit`) closes the panel. A socket that never opened is a
             // connection problem worth surfacing instead.
-            if (opened) {
+            if (opened && !failed) {
                 closeRHS();
-            } else {
+            } else if (!opened) {
                 term.write('\r\n\x1b[31m[could not connect to terminal]\x1b[0m\r\n');
             }
         };
@@ -164,7 +235,9 @@ const HostTerminal: React.FC = () => {
             socket.close();
             socketRef.current = null;
         };
-    }, [selected, send]);
+    }, [target, send]);
+
+    const nodeName = nodes.find((n) => n.id === target?.node)?.hostname;
 
     const wrapperStyle: React.CSSProperties = {
         display: 'flex',
@@ -187,20 +260,40 @@ const HostTerminal: React.FC = () => {
                     borderBottom: '1px solid #333',
                 }}
             >
-                <span>{'Shell · '}{status}</span>
+                <span>{'Shell · '}{status}{nodeName ? ` · ${nodeName}` : ''}</span>
+                {nodes.length > 0 && (
+                    <label style={{display: 'flex', alignItems: 'center', gap: 4, marginLeft: 'auto'}}>
+                        <span>{'Node:'}</span>
+                        <select
+                            value={node ?? ''}
+                            onChange={(e) => {
+                                const picked = nodes.find((n) => n.id === e.target.value);
+                                if (picked) {
+                                    saveNode(picked);
+                                    setShells([]);
+                                    setNode(picked.id);
+                                }
+                            }}
+                            style={selectStyle}
+                        >
+                            {nodes.map((n) => (
+                                <option
+                                    key={n.id}
+                                    value={n.id}
+                                >
+                                    {n.hostname}
+                                </option>
+                            ))}
+                        </select>
+                    </label>
+                )}
                 {shells.length > 0 && (
                     <label style={{display: 'flex', alignItems: 'center', gap: 4}}>
                         <span>{'Shell:'}</span>
                         <select
-                            value={selected ?? ''}
-                            onChange={(e) => setSelected(e.target.value)}
-                            style={{
-                                background: '#2b2b2b',
-                                color: '#ddd',
-                                border: '1px solid #555',
-                                borderRadius: 4,
-                                padding: '1px 4px',
-                            }}
+                            value={target?.shell ?? ''}
+                            onChange={(e) => node !== null && setTarget({node, shell: e.target.value})}
+                            style={selectStyle}
                         >
                             {shells.map((s) => (
                                 <option

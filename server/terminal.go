@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -132,10 +134,43 @@ fi
 // Output flows the other way as raw binary frames written straight from the PTY,
 // so the browser never has to parse anything.
 type clientMessage struct {
-	Type string `json:"type"`           // "data" | "resize"
-	Data string `json:"data,omitempty"` // keystrokes, for Type == "data"
-	Cols uint16 `json:"cols,omitempty"` // for Type == "resize"
+	Type string `json:"type"`           // inputData | inputResize
+	Data string `json:"data,omitempty"` // keystrokes, for inputData
+	Cols uint16 `json:"cols,omitempty"` // for inputResize
 	Rows uint16 `json:"rows,omitempty"`
+}
+
+const (
+	inputData   = "data"
+	inputResize = "resize"
+)
+
+// applyInput applies one browser control message to a PTY.
+func applyInput(ptmx *os.File, msg clientMessage) error {
+	switch msg.Type {
+	case inputData:
+		_, err := ptmx.WriteString(msg.Data)
+		return err
+	case inputResize:
+		_ = pty.Setsize(ptmx, &pty.Winsize{Rows: msg.Rows, Cols: msg.Cols})
+	}
+	return nil
+}
+
+// pumpPTY reads the PTY until it fails (the shell exited or it was closed),
+// passing each chunk to emit, and stops early if emit fails. The chunk is only
+// valid until emit returns.
+func pumpPTY(ptmx *os.File, emit func([]byte) error) {
+	buf := make([]byte, maxChunk)
+	for {
+		n, err := ptmx.Read(buf)
+		if n > 0 && emit(buf[:n]) != nil {
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 // terminalSession is one live shell attached to one websocket.
@@ -143,15 +178,22 @@ type terminalSession struct {
 	id   string
 	ptmx *os.File
 	cmd  *exec.Cmd
+
+	closeOnce sync.Once
 }
 
+// close kills the shell and reaps it, so it doesn't linger as a zombie. It is
+// safe to call more than once.
 func (s *terminalSession) close() {
-	if s.ptmx != nil {
-		_ = s.ptmx.Close()
-	}
-	if s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
-	}
+	s.closeOnce.Do(func() {
+		if s.ptmx != nil {
+			_ = s.ptmx.Close()
+		}
+		if s.cmd != nil && s.cmd.Process != nil {
+			_ = s.cmd.Process.Kill()
+			go func() { _ = s.cmd.Wait() }()
+		}
+	})
 }
 
 // sessionManager tracks active sessions so they can all be torn down on plugin
@@ -192,30 +234,27 @@ func (m *sessionManager) closeAll() {
 // handleTerminal upgrades the request to a websocket and bridges it to a PTY.
 // The Mattermost-User-ID header is guaranteed non-empty by the router's auth
 // middleware; here we additionally require system-admin before upgrading.
+//
+// With ?node=<cluster node ID> the shell runs on that node: when it is not this
+// one, the socket stays here and the session is relayed (see cluster.go).
 func (p *Plugin) handleTerminal(w http.ResponseWriter, r *http.Request) {
 	userID := r.Header.Get("Mattermost-User-ID")
-	if !p.client.User.HasPermissionTo(userID, model.PermissionManageSystem) {
+	if !p.isAdmin(userID) {
 		http.Error(w, "Forbidden: system administrator required", http.StatusForbidden)
 		return
 	}
 
-	// Resolve the shell before upgrading so we can fail cleanly if none exist.
-	requested := r.URL.Query().Get("shell")
-	shell, ok := resolveShell(requested, p.getShellPref(userID), detectShells())
-	if !ok {
-		http.Error(w, "No supported shell found on the host", http.StatusInternalServerError)
+	query := r.URL.Query()
+	target, shell := query.Get("node"), query.Get("shell")
+	remote, err := p.route(target)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	// Persist only an explicit, valid selection (so the dropdown sticks).
-	if requested != "" && requested == shell.Name {
-		p.setShellPref(userID, shell.Name)
-	}
 
-	upgrader := websocket.Upgrader{
-		CheckOrigin: p.checkTerminalOrigin,
-	}
-
-	conn, err := upgrader.Upgrade(w, r, nil)
+	// Upgrade (and so check the Origin) before starting anything, so a
+	// cross-origin request never spawns a shell or saves a preference.
+	conn, err := p.upgrader().Upgrade(w, r, nil)
 	if err != nil {
 		// Upgrade already wrote an error response on failure.
 		p.API.LogError("Terminal websocket upgrade failed", "error", err.Error())
@@ -223,16 +262,21 @@ func (p *Plugin) handleTerminal(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	cmd := p.terminalCmd(shell)
+	if remote {
+		p.relayTerminal(conn, userID, target, shell)
+	} else {
+		p.localTerminal(conn, userID, shell)
+	}
+}
 
-	ptmx, err := pty.Start(cmd)
+// localTerminal runs a shell on this node for the socket.
+func (p *Plugin) localTerminal(conn *websocket.Conn, userID, requested string) {
+	session, shell, err := p.startShell(userID, requested)
 	if err != nil {
-		p.API.LogError("Failed to start PTY", "error", err.Error())
-		_ = conn.WriteMessage(websocket.TextMessage, []byte("failed to start shell: "+err.Error()))
+		// Text frames are shown to the user as errors.
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(err.Error()))
 		return
 	}
-
-	session := &terminalSession{id: model.NewId(), ptmx: ptmx, cmd: cmd}
 	p.terminals.add(session)
 	defer p.terminals.remove(session.id)
 
@@ -240,44 +284,94 @@ func (p *Plugin) handleTerminal(w http.ResponseWriter, r *http.Request) {
 	defer p.API.LogInfo("Terminal session ended", "user_id", userID, "session_id", session.id)
 
 	// PTY output -> websocket. When the shell exits, the read errors and we close
-	// the socket, which unblocks the reader goroutine below.
+	// the socket, which unblocks the reader loop below.
 	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, readErr := ptmx.Read(buf)
-			if n > 0 {
-				if writeErr := conn.WriteMessage(websocket.BinaryMessage, buf[:n]); writeErr != nil {
-					break
-				}
-			}
-			if readErr != nil {
-				break
-			}
-		}
+		pumpPTY(session.ptmx, func(b []byte) error {
+			return conn.WriteMessage(websocket.BinaryMessage, b)
+		})
 		_ = conn.Close()
 	}()
 
-	// websocket -> PTY (runs on the handler goroutine; returning tears everything down).
+	// websocket -> PTY; returning tears everything down.
 	for {
-		_, raw, readErr := conn.ReadMessage()
-		if readErr != nil {
-			break
+		msg, ok := readClientMessage(conn)
+		if !ok || applyInput(session.ptmx, msg) != nil {
+			return
 		}
+	}
+}
 
+// relayTerminal serves a terminal whose shell runs on another cluster node. The
+// browser socket stays here; input goes to the target and its output comes back
+// through the relay.
+func (p *Plugin) relayTerminal(conn *websocket.Conn, userID, target, shell string) {
+	es, shellName, err := p.relay.openEdge(conn, target, userID, shell)
+	if err != nil {
+		// openEdge already told the browser.
+		p.API.LogError("Failed to open remote terminal", "node", target, "error", err.Error())
+		return
+	}
+	defer p.relay.closeEdge(es)
+
+	p.API.LogInfo("Remote terminal session started", "user_id", userID, "session_id", es.sid, "node", target, "shell", shellName)
+	defer p.API.LogInfo("Remote terminal session ended", "user_id", userID, "session_id", es.sid, "node", target)
+
+	for {
+		msg, ok := readClientMessage(conn)
+		if !ok {
+			return
+		}
+		if err := p.relay.sendInput(es, msg); err != nil {
+			p.API.LogWarn("Failed to send terminal input", "node", target, "session_id", es.sid, "error", err.Error())
+			return
+		}
+	}
+}
+
+// isAdmin reports whether the user may use the terminal.
+func (p *Plugin) isAdmin(userID string) bool {
+	return p.client.User.HasPermissionTo(userID, model.PermissionManageSystem)
+}
+
+// readClientMessage reads the next control envelope, skipping malformed frames.
+// It returns false once the socket is closed.
+func readClientMessage(conn *websocket.Conn) (clientMessage, bool) {
+	for {
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			return clientMessage{}, false
+		}
 		var msg clientMessage
 		if err := json.Unmarshal(raw, &msg); err != nil {
 			continue // ignore malformed control frames
 		}
-
-		switch msg.Type {
-		case "data":
-			if _, err := ptmx.WriteString(msg.Data); err != nil {
-				return
-			}
-		case "resize":
-			_ = pty.Setsize(ptmx, &pty.Winsize{Rows: msg.Rows, Cols: msg.Cols})
-		}
+		return msg, true
 	}
+}
+
+func (p *Plugin) upgrader() *websocket.Upgrader {
+	return &websocket.Upgrader{CheckOrigin: p.checkTerminalOrigin}
+}
+
+// startShell resolves the user's shell on this node and starts it on a PTY. A
+// valid explicit request is saved as the user's preference.
+func (p *Plugin) startShell(userID, requested string) (*terminalSession, shellInfo, error) {
+	shell, ok := resolveShell(requested, p.getShellPref(userID), detectShells())
+	if !ok {
+		return nil, shellInfo{}, errors.New("no supported shell found on the host")
+	}
+	// Persist only an explicit, valid selection (so the dropdown sticks).
+	if requested != "" && requested == shell.Name {
+		p.setShellPref(userID, shell.Name)
+	}
+
+	cmd := p.terminalCmd(shell)
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		p.API.LogError("Failed to start PTY", "error", err.Error())
+		return nil, shellInfo{}, fmt.Errorf("failed to start shell: %w", err)
+	}
+	return &terminalSession{id: model.NewId(), ptmx: ptmx, cmd: cmd}, shell, nil
 }
 
 // terminalCmd builds the interactive command for the chosen shell. The shell
@@ -338,25 +432,78 @@ func (p *Plugin) setShellPref(userID, name string) {
 
 // handleShells lists the shells available on the host and the caller's current
 // selection, for populating the picker. System-admin only, like the terminal.
+// With ?node= it asks that cluster node instead.
 func (p *Plugin) handleShells(w http.ResponseWriter, r *http.Request) {
 	userID := r.Header.Get("Mattermost-User-ID")
-	if !p.client.User.HasPermissionTo(userID, model.PermissionManageSystem) {
+	if !p.isAdmin(userID) {
 		http.Error(w, "Forbidden: system administrator required", http.StatusForbidden)
 		return
 	}
 
-	detected := detectShells()
-	selected, _ := resolveShell("", p.getShellPref(userID), detected)
+	query := r.URL.Query()
+	target := query.Get("node")
+	remote, err := p.route(target)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
-	resp := struct {
+	var resp struct {
 		Shells   []shellInfo `json:"shells"`
 		Selected string      `json:"selected"`
-	}{Shells: detected, Selected: selected.Name}
+	}
+	if remote {
+		resp.Shells, resp.Selected, err = p.relay.remoteShells(target, userID)
+		if err != nil {
+			http.Error(w, "Failed to list shells on node: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+	} else {
+		resp.Shells, resp.Selected = p.localShells(userID)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		p.API.LogError("Failed to encode shells response", "error", err.Error())
 	}
+}
+
+// handleNodes lists the nodes a terminal can run on: the connected cluster
+// nodes, or none when this server isn't part of a cluster. System-admin only,
+// like the terminal.
+func (p *Plugin) handleNodes(w http.ResponseWriter, r *http.Request) {
+	if !p.isAdmin(r.Header.Get("Mattermost-User-ID")) {
+		http.Error(w, "Forbidden: system administrator required", http.StatusForbidden)
+		return
+	}
+
+	infos, err := p.client.Cluster.GetNodes()
+	if err != nil {
+		p.API.LogError("Failed to list cluster nodes", "error", err.Error())
+		http.Error(w, "Failed to list cluster nodes", http.StatusInternalServerError)
+		return
+	}
+	type node struct {
+		ID        string `json:"id"`
+		Hostname  string `json:"hostname"`
+		IPAddress string `json:"ipaddress"`
+	}
+	nodes := make([]node, 0, len(infos))
+	for _, info := range infos {
+		nodes = append(nodes, node{ID: info.Id, Hostname: info.Hostname, IPAddress: info.IPAddress})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(nodes); err != nil {
+		p.API.LogError("Failed to encode nodes response", "error", err.Error())
+	}
+}
+
+// localShells returns this node's shells and the user's resolved selection.
+func (p *Plugin) localShells(userID string) ([]shellInfo, string) {
+	detected := detectShells()
+	selected, _ := resolveShell("", p.getShellPref(userID), detected)
+	return detected, selected.Name
 }
 
 // writeTerminalRC writes the shared rc file and returns its path, or "" if it
