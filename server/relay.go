@@ -1,13 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
 	"github.com/mattermost/mattermost/server/public/model"
 )
@@ -19,35 +19,41 @@ type frameSocket interface {
 	Close() error
 }
 
-// edgeSession is a browser websocket on this node whose shell runs on another.
-type edgeSession struct {
-	sid    string
-	self   string
-	target string
-	sock   frameSocket
-
-	inSeq uint64 // next input sequence number; only the socket reader uses it
-
-	opened   atomic.Bool  // the target confirmed the shell started
-	lastSeen atomic.Int64 // unix nanos of the last message from the target
-
-	mu      sync.Mutex // serializes output writes and guards the fields below
-	out     *sequencer[[]byte]
-	closing bool   // the target ended the session...
-	closeAt uint64 // ...after this many output messages
+// link is what both halves of a relayed session share: the session, this
+// node, the node on the other end, and when that node was last heard from.
+type link struct {
+	sid      string
+	self     string
+	peer     string
+	lastSeen atomic.Int64 // unix nanos
 }
 
-// targetSession is a shell on this node driven from another node's websocket.
-type targetSession struct {
-	sid    string
-	self   string
-	origin string
-	term   *terminalSession
+// msg returns an envelope of the given type for this session.
+func (l *link) msg(typ string) *clusterMessage {
+	return &clusterMessage{Type: typ, From: l.self, SID: l.sid}
+}
 
-	lastSeen atomic.Int64 // unix nanos of the last message from the edge
+func (l *link) touch() { l.lastSeen.Store(time.Now().UnixNano()) }
+
+// edgeSession is a browser websocket on this node whose shell runs on the peer.
+type edgeSession struct {
+	link
+	sock frameSocket
+
+	inSeq  uint64      // next input sequence number; only the socket reader uses it
+	opened atomic.Bool // the target confirmed the shell started
+
+	mu  sync.Mutex // serializes socket writes and guards out
+	out *sequencer
+}
+
+// targetSession is a shell on this node driven from the peer's websocket.
+type targetSession struct {
+	link
+	term *terminalSession
 
 	mu sync.Mutex // serializes PTY input and guards in
-	in *sequencer[*clusterMessage]
+	in *sequencer
 }
 
 // relay runs both halves of remote terminals: edge sessions (socket here, shell
@@ -74,10 +80,13 @@ type relay struct {
 	stopOnce     sync.Once
 
 	mu      sync.Mutex
+	closed  bool // set by closeAll; nothing registers after it
 	pending map[string]chan *clusterMessage
 	edges   map[string]*edgeSession
 	targets map[string]*targetSession
 }
+
+var errForbidden = errors.New("forbidden: system administrator required")
 
 func newRelay() *relay {
 	return &relay{
@@ -110,36 +119,35 @@ func (r *relay) start() {
 // quiet or can't be reached. Each check runs on its own goroutine because a
 // send to a dead node can block for a long time.
 func (r *relay) beat(now time.Time) {
+	type peerCheck struct {
+		link *link
+		end  func(error)
+	}
+
 	r.mu.Lock()
-	edges := make([]*edgeSession, 0, len(r.edges))
+	checks := make([]peerCheck, 0, len(r.edges)+len(r.targets))
 	for _, es := range r.edges {
 		if es.opened.Load() { // until then the open request has its own timeout
-			edges = append(edges, es)
+			checks = append(checks, peerCheck{&es.link, func(err error) {
+				if r.endEdge(es, err.Error(), false) {
+					r.logWarn("Ending remote terminal", "node", es.peer, "session_id", es.sid, "error", err.Error())
+				}
+			}})
 		}
 	}
-	targets := make([]*targetSession, 0, len(r.targets))
 	for _, ts := range r.targets {
-		targets = append(targets, ts)
+		checks = append(checks, peerCheck{&ts.link, func(err error) {
+			if r.endTarget(ts, false) {
+				r.logWarn("Ending shell for remote terminal", "node", ts.peer, "session_id", ts.sid, "error", err.Error())
+			}
+		}})
 	}
 	r.mu.Unlock()
 
-	for _, es := range edges {
+	for _, c := range checks {
 		go func() {
-			err := r.checkPeer(now, es.lastSeen.Load(), es.target, &clusterMessage{Type: msgPing, From: es.self, SID: es.sid})
-			if err != nil && r.dropEdge(es.sid) {
-				r.logWarn("Ending remote terminal", "node", es.target, "session_id", es.sid, "error", err.Error())
-				es.mu.Lock()
-				_ = es.sock.WriteMessage(websocket.TextMessage, []byte(err.Error()))
-				es.mu.Unlock()
-				_ = es.sock.Close()
-			}
-		}()
-	}
-	for _, ts := range targets {
-		go func() {
-			err := r.checkPeer(now, ts.lastSeen.Load(), ts.origin, &clusterMessage{Type: msgPing, From: ts.self, SID: ts.sid})
-			if err != nil && r.dropTarget(ts.sid) {
-				r.logWarn("Ending shell for remote terminal", "node", ts.origin, "session_id", ts.sid, "error", err.Error())
+			if err := r.checkPeer(now, c.link); err != nil {
+				c.end(err)
 			}
 		}()
 	}
@@ -147,12 +155,12 @@ func (r *relay) beat(now time.Time) {
 
 // checkPeer reports whether the peer has been silent too long, and otherwise
 // pings it.
-func (r *relay) checkPeer(now time.Time, lastSeen int64, peer string, ping *clusterMessage) error {
-	if now.Sub(time.Unix(0, lastSeen)) > r.peerTimeout {
-		return fmt.Errorf("node %s stopped responding", peer)
+func (r *relay) checkPeer(now time.Time, l *link) error {
+	if now.Sub(time.Unix(0, l.lastSeen.Load())) > r.peerTimeout {
+		return fmt.Errorf("node %s stopped responding", l.peer)
 	}
-	if err := r.publish(peer, ping); err != nil {
-		return fmt.Errorf("node %s is unreachable: %w", peer, err)
+	if err := r.publish(l.peer, l.msg(msgPing)); err != nil {
+		return fmt.Errorf("node %s is unreachable: %w", l.peer, err)
 	}
 	return nil
 }
@@ -206,34 +214,34 @@ func (r *relay) remoteShells(self, target, userID string) ([]shellInfo, string, 
 	return resp.Shells, resp.Selected, nil
 }
 
-// openEdge starts a shell on target for a websocket on this node. The returned
-// session receives output as soon as it exists, so the caller must already have
-// upgraded the socket.
+// openEdge starts a shell on target for a websocket on this node. The session
+// receives output as soon as it is registered, so the caller must already have
+// upgraded the socket. On failure the browser has been told why.
 func (r *relay) openEdge(sock frameSocket, self, target, userID, shell string) (*edgeSession, string, error) {
 	es := &edgeSession{
-		sid:    model.NewId(),
-		self:   self,
-		target: target,
-		sock:   sock,
-		out:    newSequencer[[]byte](),
+		link: link{sid: model.NewId(), self: self, peer: target},
+		sock: sock,
+		out:  newSequencer(),
 	}
 
 	r.mu.Lock()
-	r.edges[es.sid] = es
+	closed := r.closed
+	if !closed {
+		r.edges[es.sid] = es
+	}
 	r.mu.Unlock()
+	if closed {
+		return nil, "", errors.New("the plugin is shutting down")
+	}
 
 	resp, err := r.request(target, &clusterMessage{
 		Type: msgOpen, From: self, To: target, SID: es.sid, UserID: userID, Shell: shell,
 	})
 	if err != nil {
-		r.dropEdge(es.sid)
-		// A late output message may be writing to the socket; serialize with it.
-		es.mu.Lock()
-		_ = sock.WriteMessage(websocket.TextMessage, []byte("failed to start shell on node "+target+": "+err.Error()))
-		es.mu.Unlock()
+		r.endEdge(es, "failed to start shell on node "+target+": "+err.Error(), false)
 		return nil, "", err
 	}
-	es.lastSeen.Store(time.Now().UnixNano())
+	es.touch()
 	es.opened.Store(true)
 	return es, resp.Shell, nil
 }
@@ -241,27 +249,37 @@ func (r *relay) openEdge(sock frameSocket, self, target, userID, shell string) (
 // sendInput forwards one browser control message to the target. Only the
 // socket reader calls it, so inSeq needs no lock.
 func (r *relay) sendInput(es *edgeSession, cm clientMessage) error {
-	msg := &clusterMessage{Type: msgInput, From: es.self, SID: es.sid, Seq: es.inSeq, Input: cm.Type}
-	switch cm.Type {
-	case "data":
-		msg.Data = []byte(cm.Data)
-	case "resize":
-		msg.Cols, msg.Rows = cm.Cols, cm.Rows
-	default:
-		return nil
-	}
+	msg := es.msg(msgInput)
+	msg.Seq = es.inSeq
+	msg.Input = &cm
 	es.inSeq++
-	return r.publish(es.target, msg)
+	return r.publish(es.peer, msg)
 }
 
 // closeEdge ends an edge session after its socket closed and tells the target.
 func (r *relay) closeEdge(es *edgeSession) {
+	r.endEdge(es, "", true)
+}
+
+// endEdge ends an edge session: it tells the browser why (if reason is set),
+// closes the socket and, if notify, tells the target. It reports whether the
+// session was still open.
+func (r *relay) endEdge(es *edgeSession, reason string, notify bool) bool {
 	if !r.dropEdge(es.sid) {
-		return // the target already ended it
+		return false
 	}
-	if err := r.publish(es.target, &clusterMessage{Type: msgClose, From: es.self, SID: es.sid}); err != nil {
-		r.logWarn("Failed to tell node the terminal closed", "node", es.target, "session_id", es.sid, "error", err.Error())
+	if notify {
+		if err := r.publish(es.peer, es.msg(msgClose)); err != nil {
+			r.logWarn("Failed to tell node the terminal closed", "node", es.peer, "session_id", es.sid, "error", err.Error())
+		}
 	}
+	if reason != "" {
+		es.mu.Lock() // output may be writing to the socket too
+		_ = es.sock.WriteMessage(websocket.TextMessage, []byte(reason))
+		es.mu.Unlock()
+	}
+	_ = es.sock.Close()
+	return true
 }
 
 func (r *relay) dropEdge(sid string) bool {
@@ -274,12 +292,40 @@ func (r *relay) dropEdge(sid string) bool {
 	return true
 }
 
+// endTarget ends a target session, killing its shell and, if notify, telling
+// the edge. It reports whether the session was still open.
+func (r *relay) endTarget(ts *targetSession, notify bool) bool {
+	if !r.dropTarget(ts.sid) {
+		return false
+	}
+	if notify {
+		if err := r.publish(ts.peer, ts.msg(msgClose)); err != nil {
+			r.logWarn("Failed to tell node the shell ended", "node", ts.peer, "session_id", ts.sid, "error", err.Error())
+		}
+	}
+	return true
+}
+
+// dropTarget removes a target session and kills its shell. It reports whether
+// the session was still registered.
+func (r *relay) dropTarget(sid string) bool {
+	r.mu.Lock()
+	ts, ok := r.targets[sid]
+	delete(r.targets, sid)
+	r.mu.Unlock()
+	if ok {
+		ts.term.close()
+	}
+	return ok
+}
+
 // handle dispatches one envelope from another node.
 func (r *relay) handle(msg *clusterMessage) {
-	select {
-	case <-r.stop:
-		return // deactivated: don't start shells nobody will tear down
-	default:
+	r.mu.Lock()
+	closed := r.closed
+	r.mu.Unlock()
+	if closed {
+		return
 	}
 
 	switch msg.Type {
@@ -297,40 +343,43 @@ func (r *relay) handle(msg *clusterMessage) {
 		r.handleShells(msg)
 	case msgOpen:
 		r.handleOpen(msg)
-	case msgInput:
-		r.handleInput(msg)
-	case msgOutput:
-		r.handleOutput(msg)
 	case msgClose:
 		r.handleClose(msg)
-	case msgPing:
-		r.handlePing(msg)
+	case msgInput, msgOutput, msgEnd, msgPing:
+		r.handleSession(msg)
 	}
 }
 
-// handlePing records that the peer of a session is alive. A ping for a
-// session this node doesn't have means the peer outlived its partner here, so
-// it is told to end the session.
-func (r *relay) handlePing(msg *clusterMessage) {
-	now := time.Now().UnixNano()
+// handleSession routes a message for an existing session and notes that its
+// peer is alive. A message for a session this node doesn't have means the
+// sender outlived its partner here, e.g. an open that timed out on the edge
+// after the target started the shell, or a plugin restart, so the sender is
+// told to end it.
+func (r *relay) handleSession(msg *clusterMessage) {
 	r.mu.Lock()
-	es, isEdge := r.edges[msg.SID]
-	ts, isTarget := r.targets[msg.SID]
+	es := r.edges[msg.SID]
+	ts := r.targets[msg.SID]
 	r.mu.Unlock()
 
 	switch {
-	case isEdge:
-		es.lastSeen.Store(now)
-	case isTarget:
-		ts.lastSeen.Store(now)
-	default:
+	case es != nil:
+		es.touch()
+		if msg.Type == msgOutput || msg.Type == msgEnd {
+			r.handleStream(es, msg)
+		}
+	case ts != nil:
+		ts.touch()
+		if msg.Type == msgInput {
+			r.handleInput(ts, msg)
+		}
+	case msg.Type != msgEnd:
 		_ = r.publish(msg.From, &clusterMessage{Type: msgClose, SID: msg.SID})
 	}
 }
 
 func (r *relay) handleShells(msg *clusterMessage) {
 	if !r.allowed(msg.UserID) {
-		r.reply(msg, &clusterMessage{Error: "forbidden: system administrator required"})
+		r.reply(msg, &clusterMessage{Error: errForbidden.Error()})
 		return
 	}
 	shells, selected := r.shells(msg.UserID)
@@ -345,8 +394,11 @@ func (r *relay) handleOpen(msg *clusterMessage) {
 	}
 	// The edge already checked, but this node decides what runs on it.
 	if !r.allowed(msg.UserID) {
-		r.reply(msg, &clusterMessage{Error: "forbidden: system administrator required"})
+		r.reply(msg, &clusterMessage{Error: errForbidden.Error()})
 		return
+	}
+	if !r.canRegisterTarget(msg.SID) {
+		return // a duplicate open, or shutting down
 	}
 
 	term, shell, err := r.spawn(msg.UserID, msg.Shell)
@@ -356,167 +408,164 @@ func (r *relay) handleOpen(msg *clusterMessage) {
 	}
 
 	ts := &targetSession{
-		sid:    msg.SID,
-		self:   msg.To,
-		origin: msg.From,
-		term:   term,
-		in:     newSequencer[*clusterMessage](),
+		link: link{sid: msg.SID, self: msg.To, peer: msg.From},
+		term: term,
+		in:   newSequencer(),
 	}
-	ts.lastSeen.Store(time.Now().UnixNano())
+	ts.touch()
+
 	r.mu.Lock()
-	if _, dup := r.targets[ts.sid]; dup {
-		// A duplicate open; the first one already started the session.
-		r.mu.Unlock()
+	ok := !r.closed && r.targets[ts.sid] == nil // re-check: a duplicate may have raced us
+	if ok {
+		r.targets[ts.sid] = ts
+	}
+	r.mu.Unlock()
+	if !ok {
 		term.close()
 		return
 	}
-	r.targets[ts.sid] = ts
-	r.mu.Unlock()
 
 	r.reply(msg, &clusterMessage{SID: ts.sid, Shell: shell.Name})
 	go r.pumpOutput(ts)
 }
 
-// pumpOutput streams PTY output to the edge until the shell exits.
+func (r *relay) canRegisterTarget(sid string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return !r.closed && r.targets[sid] == nil
+}
+
+var errStopped = errors.New("stopped")
+
+// pumpOutput streams PTY output to the edge until the shell exits, then sends
+// end after the last output. A reader goroutine queues output while a send is
+// in flight, and whatever queued up goes out as one message, so a burst
+// doesn't cost one cluster message per read.
 func (r *relay) pumpOutput(ts *targetSession) {
-	buf := make([]byte, 32*1024)
-	var seq uint64
-	for {
-		n, readErr := ts.term.ptmx.Read(buf)
-		if n > 0 {
-			data := make([]byte, n)
-			copy(data, buf[:n])
-			msg := &clusterMessage{Type: msgOutput, From: ts.self, SID: ts.sid, Seq: seq, Data: data}
-			seq++
-			if err := r.publish(ts.origin, msg); err != nil {
-				r.logWarn("Failed to send terminal output", "node", ts.origin, "session_id", ts.sid, "error", err.Error())
-				break
+	chunks := make(chan []byte, 16)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		defer close(chunks)
+		pumpPTY(ts.term.ptmx, func(b []byte) error {
+			select {
+			case chunks <- bytes.Clone(b):
+				return nil
+			case <-done:
+				return errStopped
 			}
-		}
-		if readErr != nil {
-			break
+		})
+	}()
+
+	var seq uint64
+	for data := range chunks {
+		msg := ts.msg(msgOutput)
+		msg.Seq = seq
+		msg.Data = coalesce(data, chunks)
+		seq++
+		if err := r.publish(ts.peer, msg); err != nil {
+			r.logWarn("Failed to send terminal output", "node", ts.peer, "session_id", ts.sid, "error", err.Error())
+			r.endTarget(ts, false)
+			return
 		}
 	}
 
-	// The shell is gone; tell the edge unless it ended the session first.
+	// The shell exited; tell the edge unless the session already ended.
 	if r.dropTarget(ts.sid) {
-		if err := r.publish(ts.origin, &clusterMessage{Type: msgClose, From: ts.self, SID: ts.sid, Seq: seq}); err != nil {
-			r.logWarn("Failed to tell node the shell exited", "node", ts.origin, "session_id", ts.sid, "error", err.Error())
+		end := ts.msg(msgEnd)
+		end.Seq = seq
+		if err := r.publish(ts.peer, end); err != nil {
+			r.logWarn("Failed to tell node the shell exited", "node", ts.peer, "session_id", ts.sid, "error", err.Error())
 		}
 	}
 }
 
-func (r *relay) handleInput(msg *clusterMessage) {
-	r.mu.Lock()
-	ts, ok := r.targets[msg.SID]
-	r.mu.Unlock()
-	if !ok {
-		return
+// coalesce appends output that is already queued to data, up to maxChunk.
+func coalesce(data []byte, chunks <-chan []byte) []byte {
+	for len(data) < maxChunk {
+		select {
+		case more, ok := <-chunks:
+			if !ok {
+				return data
+			}
+			data = append(data, more...)
+		default:
+			return data
+		}
 	}
-	ts.lastSeen.Store(time.Now().UnixNano())
+	return data
+}
 
+// handleInput applies input to the shell in sequence order.
+func (r *relay) handleInput(ts *targetSession, msg *clusterMessage) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	ready, err := ts.in.push(msg.Seq, msg)
+	ready, err := ts.in.push(msg)
 	for _, in := range ready {
-		switch in.Input {
-		case "data":
-			if _, werr := ts.term.ptmx.Write(in.Data); werr != nil {
-				err = werr
-			}
-		case "resize":
-			_ = pty.Setsize(ts.term.ptmx, &pty.Winsize{Rows: in.Rows, Cols: in.Cols})
+		if in.Input == nil {
+			continue
+		}
+		if werr := applyInput(ts.term.ptmx, *in.Input); werr != nil {
+			err = werr
 		}
 	}
 	if err != nil {
 		r.logWarn("Ending remote terminal", "session_id", ts.sid, "error", err.Error())
-		ts.term.close() // pumpOutput sees the PTY close and notifies the edge
+		ts.term.close() // pumpOutput sees the PTY close and sends end
 	}
 }
 
-func (r *relay) handleOutput(msg *clusterMessage) {
-	r.mu.Lock()
-	es, ok := r.edges[msg.SID]
-	r.mu.Unlock()
-	if !ok {
-		// Nobody is watching this shell, e.g. the open request timed out here
-		// after the target had started it. Tell the target to end it.
-		_ = r.publish(msg.From, &clusterMessage{Type: msgClose, SID: msg.SID})
-		return
-	}
-	es.lastSeen.Store(time.Now().UnixNano())
-
+// handleStream writes output to the browser in sequence order and closes the
+// socket once the target's end arrives.
+func (r *relay) handleStream(es *edgeSession, msg *clusterMessage) {
 	es.mu.Lock()
 	defer es.mu.Unlock()
-	ready, err := es.out.push(msg.Seq, msg.Data)
-	for _, data := range ready {
-		if werr := es.sock.WriteMessage(websocket.BinaryMessage, data); werr != nil {
+	ready, err := es.out.push(msg)
+	for _, m := range ready {
+		if m.Type == msgEnd {
+			r.dropEdge(es.sid)
+			_ = es.sock.Close()
+			return
+		}
+		if werr := es.sock.WriteMessage(websocket.BinaryMessage, m.Data); werr != nil {
 			err = werr
 			break
 		}
 	}
 	if err != nil {
 		_ = es.sock.Close() // the socket reader sees this and calls closeEdge
-		return
-	}
-	if es.closing && es.out.next >= es.closeAt {
-		r.dropEdge(es.sid)
-		_ = es.sock.Close()
 	}
 }
 
-// handleClose ends whichever half of the session lives here. A close from the
-// target carries the number of output messages it sent, so the edge closes the
-// socket only once all of them have been written.
+// handleClose ends whichever half of the session lives here, right away.
 func (r *relay) handleClose(msg *clusterMessage) {
 	r.mu.Lock()
-	es, isEdge := r.edges[msg.SID]
+	es := r.edges[msg.SID]
 	r.mu.Unlock()
-	if isEdge {
-		es.mu.Lock()
-		es.closing, es.closeAt = true, msg.Seq
-		done := es.out.next >= msg.Seq
-		es.mu.Unlock()
-		if done {
-			r.dropEdge(es.sid)
-			_ = es.sock.Close()
-		}
+	if es != nil {
+		r.endEdge(es, "", false)
 	}
-
 	r.dropTarget(msg.SID)
 }
 
-// dropTarget removes a target session and kills its shell. It reports whether
-// the session was still registered.
-func (r *relay) dropTarget(sid string) bool {
-	r.mu.Lock()
-	ts, ok := r.targets[sid]
-	delete(r.targets, sid)
-	r.mu.Unlock()
-	if ok {
-		ts.term.close()
-	}
-	return ok
-}
-
 // closeAll ends every session on deactivation, tells the other nodes and
-// stops the heartbeat.
+// stops the heartbeat. Nothing registers afterwards.
 func (r *relay) closeAll() {
 	r.stopOnce.Do(func() { close(r.stop) })
 
 	r.mu.Lock()
-	edges := r.edges
-	targets := r.targets
+	r.closed = true
+	edges, targets := r.edges, r.targets
 	r.edges = make(map[string]*edgeSession)
 	r.targets = make(map[string]*targetSession)
 	r.mu.Unlock()
 
 	for _, es := range edges {
-		_ = r.publish(es.target, &clusterMessage{Type: msgClose, From: es.self, SID: es.sid})
+		_ = r.publish(es.peer, es.msg(msgClose))
 		_ = es.sock.Close()
 	}
 	for _, ts := range targets {
-		_ = r.publish(ts.origin, &clusterMessage{Type: msgClose, From: ts.self, SID: ts.sid})
+		_ = r.publish(ts.peer, ts.msg(msgClose))
 		ts.term.close()
 	}
 }

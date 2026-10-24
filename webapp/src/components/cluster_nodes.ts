@@ -3,14 +3,16 @@
 
 import manifest from 'manifest';
 
-// One entry of /api/v4/cluster/status.
-export type ClusterNode = {id: string; hostname: string; ipaddress: string};
+import type {ClusterInfo} from '@mattermost/types/admin';
+
+// The parts of a /api/v4/cluster/status entry the plugin uses.
+export type ClusterNode = Pick<ClusterInfo, 'id' | 'hostname' | 'ipaddress'>;
 
 // The last node picked, kept per browser. Node IDs change when a node
 // restarts, so its gossip address and host name are kept as fallbacks.
 const savedNodeKey = `${manifest.id}:node`;
 
-function loadSavedNode(): {id?: string; hostname?: string; ipaddress?: string} {
+function loadSavedNode(): Partial<ClusterNode> {
     try {
         return JSON.parse(localStorage.getItem(savedNodeKey) || '{}');
     } catch {
@@ -20,7 +22,7 @@ function loadSavedNode(): {id?: string; hostname?: string; ipaddress?: string} {
 
 export function saveNode(node: ClusterNode) {
     try {
-        localStorage.setItem(savedNodeKey, JSON.stringify({id: node.id, hostname: node.hostname, ipaddress: node.ipaddress}));
+        localStorage.setItem(savedNodeKey, JSON.stringify(node));
     } catch {
         // Storage unavailable: the choice just won't survive a refresh.
     }

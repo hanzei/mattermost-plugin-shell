@@ -30,9 +30,6 @@ type fakeCluster struct {
 func (c *fakeCluster) partition(id string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.down == nil {
-		c.down = make(map[string]bool)
-	}
 	c.down[id] = true
 }
 
@@ -47,9 +44,6 @@ func (c *fakeCluster) remove(id string) {
 func (c *fakeCluster) add(id string, r *relay) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.nodes == nil {
-		c.nodes = make(map[string]*relay)
-	}
 	c.nodes[id] = r
 	r.publish = func(target string, msg *clusterMessage) error {
 		c.mu.Lock()
@@ -136,7 +130,7 @@ func newTestRelay(t *testing.T, spawn func(string, string) (*terminalSession, sh
 // newTestCluster returns an edge relay "a" and a target relay "b".
 func newTestCluster(t *testing.T, spawn func(string, string) (*terminalSession, shellInfo, error)) (edge, target *relay, c *fakeCluster) {
 	edge, target = newTestRelay(t, nil), newTestRelay(t, spawn)
-	c = &fakeCluster{}
+	c = &fakeCluster{nodes: make(map[string]*relay), down: make(map[string]bool)}
 	c.add("a", edge)
 	c.add("b", target)
 	return edge, target, c
@@ -381,13 +375,10 @@ func TestRelayDuplicateOpenKeepsOneShell(t *testing.T) {
 	_, targets := sessionCounts(target)
 	assert.Equal(t, 1, targets)
 
-	// The duplicate's shell was killed and reaped; the registered one still runs.
+	// The duplicate never started a shell; the first one still runs.
 	mu.Lock()
 	defer mu.Unlock()
-	require.Len(t, spawned, 2)
-	require.Eventually(t, func() bool {
-		return !processExists(spawned[1].cmd.Process.Pid)
-	}, 5*time.Second, 10*time.Millisecond)
+	require.Len(t, spawned, 1)
 	assert.True(t, processExists(spawned[0].cmd.Process.Pid))
 }
 
@@ -445,33 +436,58 @@ func TestRelayIgnoresMessagesAfterClose(t *testing.T) {
 	assert.Zero(t, targets)
 }
 
+func seqMsg(seq uint64, data string) *clusterMessage {
+	return &clusterMessage{Seq: seq, Data: []byte(data)}
+}
+
+func seqData(msgs []*clusterMessage) []string {
+	out := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, string(m.Data))
+	}
+	return out
+}
+
 func TestSequencer(t *testing.T) {
-	s := newSequencer[string]()
+	s := newSequencer()
 
-	ready, err := s.push(1, "b")
+	ready, err := s.push(seqMsg(1, "b"))
 	require.NoError(t, err)
 	assert.Empty(t, ready)
 
-	ready, err = s.push(0, "a")
+	ready, err = s.push(seqMsg(0, "a"))
 	require.NoError(t, err)
-	assert.Equal(t, []string{"a", "b"}, ready)
+	assert.Equal(t, []string{"a", "b"}, seqData(ready))
 
-	ready, err = s.push(0, "dup")
+	ready, err = s.push(seqMsg(0, "dup"))
 	require.NoError(t, err)
 	assert.Empty(t, ready)
 
-	ready, err = s.push(2, "c")
+	ready, err = s.push(seqMsg(2, "c"))
 	require.NoError(t, err)
-	assert.Equal(t, []string{"c"}, ready)
+	assert.Equal(t, []string{"c"}, seqData(ready))
 }
 
 func TestSequencerGapOverflow(t *testing.T) {
-	s := newSequencer[uint64]()
+	s := newSequencer()
 	var err error
 	for i := uint64(1); i <= maxReorder+1 && err == nil; i++ {
-		_, err = s.push(i, i)
+		_, err = s.push(seqMsg(i, ""))
 	}
 	assert.Error(t, err)
+}
+
+func TestCoalesce(t *testing.T) {
+	chunks := make(chan []byte, 4)
+	chunks <- []byte("b")
+	chunks <- []byte("c")
+	assert.Equal(t, "abc", string(coalesce([]byte("a"), chunks)), "merges what is queued")
+	assert.Equal(t, "d", string(coalesce([]byte("d"), chunks)), "doesn't wait for more")
+
+	big := make([]byte, maxChunk)
+	chunks <- []byte("e")
+	assert.Len(t, coalesce(big, chunks), maxChunk, "stops at maxChunk")
+	assert.Len(t, chunks, 1)
 }
 
 func TestSelfNodeID(t *testing.T) {

@@ -134,10 +134,43 @@ fi
 // Output flows the other way as raw binary frames written straight from the PTY,
 // so the browser never has to parse anything.
 type clientMessage struct {
-	Type string `json:"type"`           // "data" | "resize"
-	Data string `json:"data,omitempty"` // keystrokes, for Type == "data"
-	Cols uint16 `json:"cols,omitempty"` // for Type == "resize"
+	Type string `json:"type"`           // inputData | inputResize
+	Data string `json:"data,omitempty"` // keystrokes, for inputData
+	Cols uint16 `json:"cols,omitempty"` // for inputResize
 	Rows uint16 `json:"rows,omitempty"`
+}
+
+const (
+	inputData   = "data"
+	inputResize = "resize"
+)
+
+// applyInput applies one browser control message to a PTY.
+func applyInput(ptmx *os.File, msg clientMessage) error {
+	switch msg.Type {
+	case inputData:
+		_, err := ptmx.WriteString(msg.Data)
+		return err
+	case inputResize:
+		_ = pty.Setsize(ptmx, &pty.Winsize{Rows: msg.Rows, Cols: msg.Cols})
+	}
+	return nil
+}
+
+// pumpPTY reads the PTY until it fails (the shell exited or it was closed),
+// passing each chunk to emit, and stops early if emit fails. The chunk is only
+// valid until emit returns.
+func pumpPTY(ptmx *os.File, emit func([]byte) error) {
+	buf := make([]byte, maxChunk)
+	for {
+		n, err := ptmx.Read(buf)
+		if n > 0 && emit(buf[:n]) != nil {
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 // terminalSession is one live shell attached to one websocket.
@@ -206,19 +239,16 @@ func (m *sessionManager) closeAll() {
 // one, the socket stays here and the session is relayed (see cluster.go).
 func (p *Plugin) handleTerminal(w http.ResponseWriter, r *http.Request) {
 	userID := r.Header.Get("Mattermost-User-ID")
-	if !p.client.User.HasPermissionTo(userID, model.PermissionManageSystem) {
+	if !p.isAdmin(userID) {
 		http.Error(w, "Forbidden: system administrator required", http.StatusForbidden)
 		return
 	}
 
 	query := r.URL.Query()
-	self, remote, err := p.clusterRoute(query.Get("node"), query.Get("nodes"))
+	target, shell := query.Get("node"), query.Get("shell")
+	self, remote, err := p.clusterRoute(target, query.Get("nodes"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if remote {
-		p.relayTerminal(w, r, userID, self, query.Get("node"), query.Get("shell"))
 		return
 	}
 
@@ -232,7 +262,16 @@ func (p *Plugin) handleTerminal(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	session, shell, err := p.startShell(userID, query.Get("shell"))
+	if remote {
+		p.relayTerminal(conn, userID, self, target, shell)
+	} else {
+		p.localTerminal(conn, userID, shell)
+	}
+}
+
+// localTerminal runs a shell on this node for the socket.
+func (p *Plugin) localTerminal(conn *websocket.Conn, userID, requested string) {
+	session, shell, err := p.startShell(userID, requested)
 	if err != nil {
 		// Text frames are shown to the user as errors.
 		_ = conn.WriteMessage(websocket.TextMessage, []byte(err.Error()))
@@ -241,43 +280,23 @@ func (p *Plugin) handleTerminal(w http.ResponseWriter, r *http.Request) {
 	p.terminals.add(session)
 	defer p.terminals.remove(session.id)
 
-	ptmx := session.ptmx
-
 	p.API.LogInfo("Terminal session started", "user_id", userID, "session_id", session.id, "shell", shell.Name)
 	defer p.API.LogInfo("Terminal session ended", "user_id", userID, "session_id", session.id)
 
 	// PTY output -> websocket. When the shell exits, the read errors and we close
-	// the socket, which unblocks the reader goroutine below.
+	// the socket, which unblocks the reader loop below.
 	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, readErr := ptmx.Read(buf)
-			if n > 0 {
-				if writeErr := conn.WriteMessage(websocket.BinaryMessage, buf[:n]); writeErr != nil {
-					break
-				}
-			}
-			if readErr != nil {
-				break
-			}
-		}
+		pumpPTY(session.ptmx, func(b []byte) error {
+			return conn.WriteMessage(websocket.BinaryMessage, b)
+		})
 		_ = conn.Close()
 	}()
 
-	// websocket -> PTY (runs on the handler goroutine; returning tears everything down).
+	// websocket -> PTY; returning tears everything down.
 	for {
 		msg, ok := readClientMessage(conn)
-		if !ok {
-			break
-		}
-
-		switch msg.Type {
-		case "data":
-			if _, err := ptmx.WriteString(msg.Data); err != nil {
-				return
-			}
-		case "resize":
-			_ = pty.Setsize(ptmx, &pty.Winsize{Rows: msg.Rows, Cols: msg.Cols})
+		if !ok || applyInput(session.ptmx, msg) != nil {
+			return
 		}
 	}
 }
@@ -285,17 +304,10 @@ func (p *Plugin) handleTerminal(w http.ResponseWriter, r *http.Request) {
 // relayTerminal serves a terminal whose shell runs on another cluster node. The
 // browser socket stays here; input goes to the target and its output comes back
 // through the relay.
-func (p *Plugin) relayTerminal(w http.ResponseWriter, r *http.Request, userID, self, target, shell string) {
-	conn, err := p.upgrader().Upgrade(w, r, nil)
-	if err != nil {
-		p.API.LogError("Terminal websocket upgrade failed", "error", err.Error())
-		return
-	}
-	defer func() { _ = conn.Close() }()
-
+func (p *Plugin) relayTerminal(conn *websocket.Conn, userID, self, target, shell string) {
 	es, shellName, err := p.relay.openEdge(conn, self, target, userID, shell)
 	if err != nil {
-		// openEdge already told the browser; output handlers may share the socket.
+		// openEdge already told the browser.
 		p.API.LogError("Failed to open remote terminal", "node", target, "error", err.Error())
 		return
 	}
@@ -314,6 +326,11 @@ func (p *Plugin) relayTerminal(w http.ResponseWriter, r *http.Request, userID, s
 			return
 		}
 	}
+}
+
+// isAdmin reports whether the user may use the terminal.
+func (p *Plugin) isAdmin(userID string) bool {
+	return p.client.User.HasPermissionTo(userID, model.PermissionManageSystem)
 }
 
 // readClientMessage reads the next control envelope, skipping malformed frames.
@@ -418,13 +435,14 @@ func (p *Plugin) setShellPref(userID, name string) {
 // With ?node= it asks that cluster node instead.
 func (p *Plugin) handleShells(w http.ResponseWriter, r *http.Request) {
 	userID := r.Header.Get("Mattermost-User-ID")
-	if !p.client.User.HasPermissionTo(userID, model.PermissionManageSystem) {
+	if !p.isAdmin(userID) {
 		http.Error(w, "Forbidden: system administrator required", http.StatusForbidden)
 		return
 	}
 
 	query := r.URL.Query()
-	self, remote, err := p.clusterRoute(query.Get("node"), query.Get("nodes"))
+	target := query.Get("node")
+	self, remote, err := p.clusterRoute(target, query.Get("nodes"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -435,7 +453,7 @@ func (p *Plugin) handleShells(w http.ResponseWriter, r *http.Request) {
 		Selected string      `json:"selected"`
 	}
 	if remote {
-		resp.Shells, resp.Selected, err = p.relay.remoteShells(self, query.Get("node"), userID)
+		resp.Shells, resp.Selected, err = p.relay.remoteShells(self, target, userID)
 		if err != nil {
 			http.Error(w, "Failed to list shells on node: "+err.Error(), http.StatusBadGateway)
 			return

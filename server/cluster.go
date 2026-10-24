@@ -21,30 +21,40 @@ import (
 // through cluster events addressed to one node (PublishPluginClusterEvent with a
 // TargetId), so nothing is broadcast and no node-to-node HTTP is needed:
 //
-//	browser <-ws-> edge --open/input/close--> target (PTY)
-//	               edge <--output/close------ target
+//	browser <-ws-> edge --open/input/close-----> target (PTY)
+//	               edge <--output/end/close----- target
 //
 // Input and output are one-way streams; only open and shell listing wait for a
-// reply. Each stream carries a sequence number so the receiver can restore order
-// whatever the cluster transport guarantees.
+// reply. The reliable cluster channel doesn't keep order: Mattermost Enterprise
+// sends each message with its own memberlist SendReliable call (retrying once
+// on failure) and handles each received message on its own goroutine. So each
+// stream carries a sequence number, and the receiver restores order and drops
+// duplicates.
 
 // clusterEventID is the PluginClusterEvent.Id used for every message; the
 // envelope's Type says what it is.
 const clusterEventID = "shell"
 
 const (
-	msgOpen        = "open"   // edge -> target: start a shell (request)
-	msgInput       = "input"  // edge -> target: keystrokes / resize
-	msgOutput      = "output" // target -> edge: PTY bytes
-	msgClose       = "close"  // either way: session is over
-	msgShells      = "shells" // edge -> target: list shells (request)
-	msgReply       = "reply"  // response to a request
-	msgPing        = "ping"   // either way: heartbeat for a session
+	msgOpen   = "open"   // edge -> target: start a shell (request)
+	msgInput  = "input"  // edge -> target: keystrokes / resize (sequenced)
+	msgOutput = "output" // target -> edge: PTY bytes (sequenced)
+	msgEnd    = "end"    // target -> edge: the shell exited, after the last output (sequenced)
+	msgClose  = "close"  // either way: end the session now
+	msgShells = "shells" // edge -> target: list shells (request)
+	msgReply  = "reply"  // response to a request
+	msgPing   = "ping"   // either way: heartbeat for a session
+)
+
+const (
 	requestTimeout = 10 * time.Second
 
 	// maxReorder bounds how many out-of-order messages a session buffers before
 	// giving up on it; a gap this large means a message was lost.
 	maxReorder = 1024
+
+	// maxChunk caps how much queued PTY output is merged into one message.
+	maxChunk = 32 * 1024
 )
 
 // clusterMessage is the envelope carried in PluginClusterEvent.Data.
@@ -56,12 +66,10 @@ type clusterMessage struct {
 	SID   string `json:"sid,omitempty"`    // terminal session
 	Seq   uint64 `json:"seq,omitempty"`
 
-	UserID string `json:"user_id,omitempty"`
-	Shell  string `json:"shell,omitempty"`
-	Data   []byte `json:"data,omitempty"`
-	Cols   uint16 `json:"cols,omitempty"`
-	Rows   uint16 `json:"rows,omitempty"`
-	Input  string `json:"input,omitempty"` // "data" | "resize", for msgInput
+	UserID string         `json:"user_id,omitempty"`
+	Shell  string         `json:"shell,omitempty"`
+	Data   []byte         `json:"data,omitempty"`  // PTY output, for msgOutput
+	Input  *clientMessage `json:"input,omitempty"` // browser control message, for msgInput
 
 	Error    string      `json:"error,omitempty"`
 	Shells   []shellInfo `json:"shells,omitempty"`
@@ -173,32 +181,33 @@ func (p *Plugin) localIdentity() localIdentity {
 	return local
 }
 
-// sequencer releases items in sequence order, holding back any that arrive
-// early. It is not safe for concurrent use; callers lock around it.
-type sequencer[T any] struct {
+// sequencer releases messages in sequence order, holding back any that arrive
+// early and dropping duplicates. It is not safe for concurrent use; callers
+// lock around it.
+type sequencer struct {
 	next    uint64
-	pending map[uint64]T
+	pending map[uint64]*clusterMessage
 }
 
-func newSequencer[T any]() *sequencer[T] {
-	return &sequencer[T]{pending: make(map[uint64]T)}
+func newSequencer() *sequencer {
+	return &sequencer{pending: make(map[uint64]*clusterMessage)}
 }
 
-// push accepts the item with sequence number seq and returns every item that is
-// now ready, in order. It errors when too many items are waiting on a gap.
-func (s *sequencer[T]) push(seq uint64, item T) ([]T, error) {
-	if seq < s.next {
+// push accepts msg and returns every message that is now ready, in order. It
+// errors when too many messages are waiting on a gap.
+func (s *sequencer) push(msg *clusterMessage) ([]*clusterMessage, error) {
+	if msg.Seq < s.next {
 		return nil, nil // duplicate
 	}
-	s.pending[seq] = item
-	var ready []T
+	s.pending[msg.Seq] = msg
+	var ready []*clusterMessage
 	for {
-		it, ok := s.pending[s.next]
+		m, ok := s.pending[s.next]
 		if !ok {
 			break
 		}
 		delete(s.pending, s.next)
-		ready = append(ready, it)
+		ready = append(ready, m)
 		s.next++
 	}
 	if len(s.pending) > maxReorder {
@@ -214,7 +223,7 @@ func (p *Plugin) publishCluster(target string, msg *clusterMessage) error {
 	if err != nil {
 		return err
 	}
-	return p.API.PublishPluginClusterEvent(
+	return p.client.Cluster.PublishPluginEvent(
 		model.PluginClusterEvent{Id: clusterEventID, Data: data},
 		model.PluginClusterEventSendOptions{
 			SendType: model.PluginClusterEventSendTypeReliable,

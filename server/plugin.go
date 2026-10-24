@@ -53,9 +53,7 @@ func (p *Plugin) OnActivate() error {
 
 	p.relay = newRelay()
 	p.relay.publish = p.publishCluster
-	p.relay.allowed = func(userID string) bool {
-		return p.client.User.HasPermissionTo(userID, model.PermissionManageSystem)
-	}
+	p.relay.allowed = p.isAdmin
 	p.relay.spawn = p.startShell
 	p.relay.shells = p.localShells
 	p.relay.logWarn = p.API.LogWarn

@@ -33,7 +33,7 @@ function routeParams(node: string, nodes: ClusterNode[]): URLSearchParams {
     const params = new URLSearchParams();
     if (node) {
         params.set('node', node);
-        params.set('nodes', JSON.stringify(nodes.map(({id, hostname, ipaddress}) => ({id, hostname, ipaddress}))));
+        params.set('nodes', JSON.stringify(nodes));
     }
     return params;
 }
@@ -62,14 +62,18 @@ const HostTerminal: React.FC = () => {
 
     // Cluster nodes; empty unless the server is a cluster of more than one.
     const [nodes, setNodes] = useState<ClusterNode[]>([]);
-    const nodesRef = useRef<ClusterNode[]>([]);
 
-    // The node the shell runs on: null until the node list has loaded, '' when
-    // there is no choice to make (a single server).
+    // The node picked: null until the node list has loaded, '' when there is no
+    // choice to make (a single server).
     const [node, setNode] = useState<string | null>(null);
 
+    // The shells on the picked node. Empty while they load.
     const [shells, setShells] = useState<ShellInfo[]>([]);
-    const [selected, setSelected] = useState<string | null>(null);
+
+    // What the socket connects to. A shell name only means something on the
+    // node it was listed for, so the two change together: picking another node
+    // keeps the old session until that node's shells are known.
+    const [target, setTarget] = useState<{node: string; shell: string} | null>(null);
     const [status, setStatus] = useState<'connecting' | 'open' | 'closed'>('connecting');
 
     const send = useCallback((msg: ClientMessage) => {
@@ -143,12 +147,12 @@ const HostTerminal: React.FC = () => {
                 // so a shell can't run on them.
                 const connected = (Array.isArray(data) ? data : []).
                     filter((n) => n.ipaddress).
+                    map(({id, hostname, ipaddress}) => ({id, hostname, ipaddress})).
                     sort((a, b) => a.hostname.localeCompare(b.hostname));
                 if (connected.length < 2) {
                     setNode('');
                     return;
                 }
-                nodesRef.current = connected;
                 setNodes(connected);
                 setNode(pickNode(connected).id);
             }).
@@ -169,29 +173,28 @@ const HostTerminal: React.FC = () => {
             return undefined; // wait for the node list
         }
         let cancelled = false;
-        fetch(pluginURL('shells', routeParams(node, nodesRef.current)), {credentials: 'same-origin'}).
+        fetch(pluginURL('shells', routeParams(node, nodes)), {credentials: 'same-origin'}).
             then((res) => res.json()).
             then((data: ShellsResponse) => {
                 if (cancelled) {
                     return;
                 }
                 setShells(data.shells || []);
-                setSelected(data.selected || '');
+                setTarget({node, shell: data.selected || ''});
             }).
             catch(() => {
                 if (!cancelled) {
-                    setShells([]);
-                    setSelected(''); // fall back to the server default
+                    setTarget({node, shell: ''}); // fall back to the server default
                 }
             });
         return () => {
             cancelled = true;
         };
-    }, [node]);
+    }, [node, nodes]);
 
-    // Connect the socket once a shell is known; reconnect when it changes.
+    // Connect the socket once a target is known; reconnect when it changes.
     useEffect(() => {
-        if (selected === null || node === null) {
+        if (target === null) {
             return undefined; // wait for the shells fetch to resolve
         }
         const term = termRef.current;
@@ -204,7 +207,7 @@ const HostTerminal: React.FC = () => {
 
         let opened = false;
         let failed = false;
-        const socket = new WebSocket(terminalSocketURL(selected, routeParams(node, nodesRef.current)));
+        const socket = new WebSocket(terminalSocketURL(target.shell, routeParams(target.node, nodes)));
         socket.binaryType = 'arraybuffer';
         socketRef.current = socket;
 
@@ -242,9 +245,9 @@ const HostTerminal: React.FC = () => {
             socket.close();
             socketRef.current = null;
         };
-    }, [selected, node, send]);
+    }, [target, nodes, send]);
 
-    const nodeName = nodes.find((n) => n.id === node)?.hostname;
+    const nodeName = nodes.find((n) => n.id === target?.node)?.hostname;
 
     const wrapperStyle: React.CSSProperties = {
         display: 'flex',
@@ -277,11 +280,7 @@ const HostTerminal: React.FC = () => {
                                 const picked = nodes.find((n) => n.id === e.target.value);
                                 if (picked) {
                                     saveNode(picked);
-
-                                    // Hold the socket until the node's shells
-                                    // are known; set together with the node so
-                                    // no render connects with the old shell.
-                                    setSelected(null);
+                                    setShells([]);
                                     setNode(picked.id);
                                 }
                             }}
@@ -302,8 +301,8 @@ const HostTerminal: React.FC = () => {
                     <label style={{display: 'flex', alignItems: 'center', gap: 4}}>
                         <span>{'Shell:'}</span>
                         <select
-                            value={selected ?? ''}
-                            onChange={(e) => setSelected(e.target.value)}
+                            value={target?.shell ?? ''}
+                            onChange={(e) => node !== null && setTarget({node, shell: e.target.value})}
                             style={selectStyle}
                         >
                             {shells.map((s) => (
