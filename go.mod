@@ -6,7 +6,7 @@ require (
 	github.com/creack/pty v1.1.24
 	github.com/gorilla/mux v1.8.1
 	github.com/gorilla/websocket v1.5.3
-	github.com/mattermost/mattermost/server/public v0.5.1-0.20261024092728-99d799f946e7
+	github.com/mattermost/mattermost/server/public v0.6.0
 	github.com/pkg/errors v0.9.1
 	github.com/stretchr/testify v1.12.1
 	go.uber.org/mock v0.6.0
