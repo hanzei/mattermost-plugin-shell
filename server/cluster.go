@@ -13,7 +13,7 @@ import (
 	"github.com/mattermost/mattermost/server/public/plugin"
 )
 
-// Cluster-aware terminals ("option A").
+// Cluster-aware terminals.
 //
 // The browser's terminal websocket lands on whatever node the load balancer
 // picks (the "edge"). When the user asked for a different node (the "target"),
