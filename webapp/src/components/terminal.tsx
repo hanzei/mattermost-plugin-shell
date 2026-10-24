@@ -20,7 +20,7 @@ type ShellInfo = {name: string; path: string};
 type ShellsResponse = {shells: ShellInfo[]; selected: string};
 
 // One entry of /api/v4/cluster/status.
-type ClusterNode = {id: string; hostname: string};
+type ClusterNode = {id: string; hostname: string; ipaddress: string};
 
 function pluginURL(path: string, params?: URLSearchParams): string {
     const query = params && params.toString() ? `?${params.toString()}` : '';
@@ -33,7 +33,7 @@ function routeParams(node: string, nodes: ClusterNode[]): URLSearchParams {
     const params = new URLSearchParams();
     if (node) {
         params.set('node', node);
-        params.set('nodes', nodes.map((n) => `${n.id}:${n.hostname}`).join(','));
+        params.set('nodes', JSON.stringify(nodes.map(({id, hostname, ipaddress}) => ({id, hostname, ipaddress}))));
     }
     return params;
 }

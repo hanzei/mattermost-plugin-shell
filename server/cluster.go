@@ -4,8 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
-	"strings"
+	"strconv"
 	"time"
 
 	"github.com/mattermost/mattermost/server/public/model"
@@ -66,63 +67,109 @@ type clusterMessage struct {
 	Selected string      `json:"selected,omitempty"`
 }
 
-// clusterNode is one entry of the node list the webapp reads from
-// /api/v4/cluster/status.
+// clusterNode is one entry of /api/v4/cluster/status, which the webapp passes
+// along as the "nodes" query parameter.
 type clusterNode struct {
-	ID       string
-	Hostname string
+	ID        string `json:"id"`
+	Hostname  string `json:"hostname"`
+	IPAddress string `json:"ipaddress"` // gossip address, ip:port
 }
 
-// parseNodes decodes the "nodes" query parameter: comma-separated id:hostname
-// pairs. Malformed entries are skipped.
-func parseNodes(raw string) []clusterNode {
-	var out []clusterNode
-	for entry := range strings.SplitSeq(raw, ",") {
-		id, host, ok := strings.Cut(strings.TrimSpace(entry), ":")
-		if !ok || id == "" || host == "" {
-			continue
-		}
-		out = append(out, clusterNode{ID: id, Hostname: host})
+// localIdentity is what this host knows about itself, to find itself in the
+// node list.
+type localIdentity struct {
+	names      map[string]bool // host name, configured override/advertise names
+	ips        map[string]bool // local interface addresses
+	gossipPort string
+}
+
+// splitHost strips an optional port from addr.
+func splitHost(addr string) (host, port string) {
+	if h, p, err := net.SplitHostPort(addr); err == nil {
+		return h, p
 	}
-	return out
+	return addr, ""
 }
 
-// selfNodeID finds this node's cluster ID by matching the host name against the
-// cluster's node list. The plugin API has no way to ask for the node ID
-// directly yet, but the plugin runs on the same host as its server, so the host
-// names agree.
-func selfNodeID(nodes []clusterNode, hostname string) (string, bool) {
+// selfNodeID finds this node in the cluster's node list. The plugin API can't
+// report the node ID yet, so it matches what the cluster advertises for each
+// node: first the gossip address against local interfaces and the gossip port
+// (which also tells apart nodes sharing a host), then the advertised name,
+// which is the host name, an IP or ClusterSettings.OverrideHostname.
+func selfNodeID(nodes []clusterNode, local localIdentity) (string, error) {
+	var byAddr, byName []string
 	for _, n := range nodes {
-		if n.Hostname == hostname {
-			return n.ID, true
+		if ip, port := splitHost(n.IPAddress); local.ips[ip] && (local.gossipPort == "" || port == local.gossipPort) {
+			byAddr = append(byAddr, n.ID)
+		}
+		if name, _ := splitHost(n.Hostname); local.names[name] || local.ips[name] {
+			byName = append(byName, n.ID)
 		}
 	}
-	return "", false
+	for _, matches := range [][]string{byAddr, byName} {
+		switch len(matches) {
+		case 0:
+			continue
+		case 1:
+			return matches[0], nil
+		default:
+			return "", errors.New("several cluster nodes match this host")
+		}
+	}
+	return "", errors.New("this host does not match any cluster node")
 }
 
 // resolveRoute decides whether a request for target runs locally. It returns
 // the local node ID when the session must be relayed.
-func resolveRoute(target string, nodes []clusterNode, hostname string) (self string, remote bool, err error) {
+func resolveRoute(target string, nodes []clusterNode, local localIdentity) (self string, remote bool, err error) {
 	if target == "" {
 		return "", false, nil
 	}
-	self, ok := selfNodeID(nodes, hostname)
-	if !ok {
-		return "", false, fmt.Errorf("could not identify this node (host %q) in the cluster node list", hostname)
+	self, err = selfNodeID(nodes, local)
+	if err != nil {
+		return "", false, fmt.Errorf("could not identify this node in the cluster node list: %w", err)
 	}
-	if self == target {
-		return self, false, nil
-	}
-	return self, true, nil
+	return self, self != target, nil
 }
 
 // clusterRoute reads the node and nodes query parameters for a request.
-func clusterRoute(target, rawNodes string) (self string, remote bool, err error) {
-	hostname, err := os.Hostname()
-	if err != nil {
-		return "", false, fmt.Errorf("could not read host name: %w", err)
+func (p *Plugin) clusterRoute(target, rawNodes string) (self string, remote bool, err error) {
+	if target == "" {
+		return "", false, nil
 	}
-	return resolveRoute(target, parseNodes(rawNodes), hostname)
+	var nodes []clusterNode
+	if err := json.Unmarshal([]byte(rawNodes), &nodes); err != nil {
+		return "", false, fmt.Errorf("invalid nodes parameter: %w", err)
+	}
+	return resolveRoute(target, nodes, p.localIdentity())
+}
+
+// localIdentity collects this host's names and addresses.
+func (p *Plugin) localIdentity() localIdentity {
+	local := localIdentity{names: make(map[string]bool), ips: make(map[string]bool)}
+	if hostname, err := os.Hostname(); err == nil {
+		local.names[hostname] = true
+	}
+	if addrs, err := net.InterfaceAddrs(); err == nil {
+		for _, addr := range addrs {
+			if ipNet, ok := addr.(*net.IPNet); ok {
+				local.ips[ipNet.IP.String()] = true
+			}
+		}
+	}
+	if cfg := p.client.Configuration.GetConfig(); cfg != nil {
+		cs := cfg.ClusterSettings
+		for _, name := range []*string{cs.OverrideHostname, cs.AdvertiseAddress} {
+			if name != nil && *name != "" {
+				host, _ := splitHost(*name)
+				local.names[host] = true
+			}
+		}
+		if cs.GossipPort != nil {
+			local.gossipPort = strconv.Itoa(*cs.GossipPort)
+		}
+	}
+	return local
 }
 
 // sequencer releases items in sequence order, holding back any that arrive

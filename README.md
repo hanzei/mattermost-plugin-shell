@@ -56,8 +56,10 @@ whatever the cluster transport guarantees. The target node re-checks that the
 user is a system admin before it starts a shell.
 
 The plugin API can't tell a node its own cluster ID yet, so the webapp sends
-the node list with the request and the edge finds itself by host name. If the
-host name doesn't match any node, the request fails with an error.
+the node list with the request and the edge finds itself in it: first by its
+gossip address (local interface IP plus `ClusterSettings.GossipPort`), then by
+the advertised name (host name, IP or `OverrideHostname`). If nothing matches,
+or several nodes do, the request fails with an error.
 
 Known limits: if the target node dies, the terminal stays open until it is
 closed, and `/exec` and `/inspect` still run on whichever node receives the

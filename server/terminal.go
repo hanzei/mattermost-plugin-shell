@@ -205,7 +205,7 @@ func (p *Plugin) handleTerminal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := r.URL.Query()
-	self, remote, err := clusterRoute(query.Get("node"), query.Get("nodes"))
+	self, remote, err := p.clusterRoute(query.Get("node"), query.Get("nodes"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -415,7 +415,7 @@ func (p *Plugin) handleShells(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := r.URL.Query()
-	self, remote, err := clusterRoute(query.Get("node"), query.Get("nodes"))
+	self, remote, err := p.clusterRoute(query.Get("node"), query.Get("nodes"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

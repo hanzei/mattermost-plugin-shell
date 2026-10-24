@@ -276,44 +276,99 @@ func TestSequencerGapOverflow(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestParseNodes(t *testing.T) {
-	nodes := parseNodes("id1:host-a, id2:host-b,broken,:nohost,noid:,id3:host-c")
-	assert.Equal(t, []clusterNode{
-		{ID: "id1", Hostname: "host-a"},
-		{ID: "id2", Hostname: "host-b"},
-		{ID: "id3", Hostname: "host-c"},
-	}, nodes)
-	assert.Empty(t, parseNodes(""))
-}
-
-func TestResolveRoute(t *testing.T) {
-	nodes := []clusterNode{{ID: "n1", Hostname: "host-a"}, {ID: "n2", Hostname: "host-b"}}
+func TestSelfNodeID(t *testing.T) {
+	local := localIdentity{
+		names:      map[string]bool{"app-1": true},
+		ips:        map[string]bool{"10.0.0.1": true, "127.0.0.1": true},
+		gossipPort: "8074",
+	}
 
 	tests := []struct {
-		name       string
-		target     string
-		nodes      []clusterNode
-		hostname   string
-		wantSelf   string
-		wantRemote bool
-		wantErr    bool
+		name    string
+		nodes   []clusterNode
+		want    string
+		wantErr bool
 	}{
-		{name: "no node requested runs locally", hostname: "host-a"},
-		{name: "this node runs locally", target: "n1", nodes: nodes, hostname: "host-a", wantSelf: "n1"},
-		{name: "other node is relayed", target: "n2", nodes: nodes, hostname: "host-a", wantSelf: "n1", wantRemote: true},
-		{name: "unknown local host is an error", target: "n2", nodes: nodes, hostname: "host-z", wantErr: true},
-		{name: "missing node list is an error", target: "n2", hostname: "host-a", wantErr: true},
+		{
+			name: "default setup advertises the IP as host name",
+			nodes: []clusterNode{
+				{ID: "n1", Hostname: "10.0.0.1", IPAddress: "10.0.0.1:8074"},
+				{ID: "n2", Hostname: "10.0.0.2", IPAddress: "10.0.0.2:8074"},
+			},
+			want: "n1",
+		},
+		{
+			name: "gossip port tells apart nodes on one host",
+			nodes: []clusterNode{
+				{ID: "n1", Hostname: "127.0.0.1", IPAddress: "127.0.0.1:8075"},
+				{ID: "n2", Hostname: "127.0.0.1", IPAddress: "127.0.0.1:8074"},
+			},
+			want: "n2",
+		},
+		{
+			name: "falls back to the host name",
+			nodes: []clusterNode{
+				{ID: "n1", Hostname: "app-1"},
+				{ID: "n2", Hostname: "app-2"},
+			},
+			want: "n1",
+		},
+		{
+			name: "host name with port",
+			nodes: []clusterNode{
+				{ID: "n1", Hostname: "app-2:8074"},
+				{ID: "n2", Hostname: "app-1:8074"},
+			},
+			want: "n2",
+		},
+		{
+			name: "no match",
+			nodes: []clusterNode{
+				{ID: "n1", Hostname: "app-2", IPAddress: "10.0.0.2:8074"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "ambiguous match",
+			nodes: []clusterNode{
+				{ID: "n1", Hostname: "app-1"},
+				{ID: "n2", Hostname: "app-1"},
+			},
+			wantErr: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			self, remote, err := resolveRoute(tt.target, tt.nodes, tt.hostname)
+			got, err := selfNodeID(tt.nodes, local)
 			if tt.wantErr {
 				assert.Error(t, err)
 				return
 			}
 			require.NoError(t, err)
-			assert.Equal(t, tt.wantSelf, self)
-			assert.Equal(t, tt.wantRemote, remote)
+			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestResolveRoute(t *testing.T) {
+	nodes := []clusterNode{{ID: "n1", Hostname: "host-a"}, {ID: "n2", Hostname: "host-b"}}
+	local := localIdentity{names: map[string]bool{"host-a": true}}
+
+	self, remote, err := resolveRoute("", nil, local)
+	require.NoError(t, err)
+	assert.Empty(t, self)
+	assert.False(t, remote, "no node requested runs locally")
+
+	self, remote, err = resolveRoute("n1", nodes, local)
+	require.NoError(t, err)
+	assert.Equal(t, "n1", self)
+	assert.False(t, remote, "this node runs locally")
+
+	self, remote, err = resolveRoute("n2", nodes, local)
+	require.NoError(t, err)
+	assert.Equal(t, "n1", self)
+	assert.True(t, remote, "other node is relayed")
+
+	_, _, err = resolveRoute("n2", nil, local)
+	assert.Error(t, err, "missing node list")
 }
