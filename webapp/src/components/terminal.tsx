@@ -7,6 +7,9 @@ import '@xterm/xterm/css/xterm.css';
 import manifest from 'manifest';
 import React, {useCallback, useEffect, useRef, useState} from 'react';
 
+import type {ClusterNode} from './cluster_nodes';
+import {pickNode, saveNode} from './cluster_nodes';
+
 import {closeRHS} from '../rhs';
 
 // Output flows backend -> browser as raw binary frames written straight to
@@ -18,9 +21,6 @@ type ClientMessage =
 type ShellInfo = {name: string; path: string};
 
 type ShellsResponse = {shells: ShellInfo[]; selected: string};
-
-// One entry of /api/v4/cluster/status.
-type ClusterNode = {id: string; hostname: string; ipaddress: string};
 
 function pluginURL(path: string, params?: URLSearchParams): string {
     const query = params && params.toString() ? `?${params.toString()}` : '';
@@ -63,7 +63,10 @@ const HostTerminal: React.FC = () => {
     // Cluster nodes; empty unless the server is a cluster of more than one.
     const [nodes, setNodes] = useState<ClusterNode[]>([]);
     const nodesRef = useRef<ClusterNode[]>([]);
-    const [node, setNode] = useState(''); // '' = whichever node serves the request
+
+    // The node the shell runs on: null until the node list has loaded, '' when
+    // there is no choice to make (a single server).
+    const [node, setNode] = useState<string | null>(null);
 
     const [shells, setShells] = useState<ShellInfo[]>([]);
     const [selected, setSelected] = useState<string | null>(null);
@@ -132,15 +135,28 @@ const HostTerminal: React.FC = () => {
         }).
             then((res) => (res.ok ? res.json() : [])).
             then((data: ClusterNode[]) => {
-                if (cancelled || !Array.isArray(data) || data.length < 2) {
+                if (cancelled) {
                     return;
                 }
-                const sorted = [...data].sort((a, b) => a.hostname.localeCompare(b.hostname));
-                nodesRef.current = sorted;
-                setNodes(sorted);
+
+                // Nodes without an address are registered but not connected,
+                // so a shell can't run on them.
+                const connected = (Array.isArray(data) ? data : []).
+                    filter((n) => n.ipaddress).
+                    sort((a, b) => a.hostname.localeCompare(b.hostname));
+                if (connected.length < 2) {
+                    setNode('');
+                    return;
+                }
+                nodesRef.current = connected;
+                setNodes(connected);
+                setNode(pickNode(connected).id);
             }).
             catch(() => {
                 // Not a cluster, or no permission: the node picker stays hidden.
+                if (!cancelled) {
+                    setNode('');
+                }
             });
         return () => {
             cancelled = true;
@@ -149,6 +165,9 @@ const HostTerminal: React.FC = () => {
 
     // Load the available shells and the saved selection for the chosen node.
     useEffect(() => {
+        if (node === null) {
+            return undefined; // wait for the node list
+        }
         let cancelled = false;
         setSelected(null); // hold the socket until the node's shells are known
         fetch(pluginURL('shells', routeParams(node, nodesRef.current)), {credentials: 'same-origin'}).
@@ -173,7 +192,7 @@ const HostTerminal: React.FC = () => {
 
     // Connect the socket once a shell is known; reconnect when it changes.
     useEffect(() => {
-        if (selected === null) {
+        if (selected === null || node === null) {
             return undefined; // wait for the shells fetch to resolve
         }
         const term = termRef.current;
@@ -254,11 +273,16 @@ const HostTerminal: React.FC = () => {
                     <label style={{display: 'flex', alignItems: 'center', gap: 4, marginLeft: 'auto'}}>
                         <span>{'Node:'}</span>
                         <select
-                            value={node}
-                            onChange={(e) => setNode(e.target.value)}
+                            value={node ?? ''}
+                            onChange={(e) => {
+                                const picked = nodes.find((n) => n.id === e.target.value);
+                                if (picked) {
+                                    saveNode(picked);
+                                    setNode(picked.id);
+                                }
+                            }}
                             style={selectStyle}
                         >
-                            <option value=''>{'Any (load balanced)'}</option>
                             {nodes.map((n) => (
                                 <option
                                     key={n.id}

@@ -43,12 +43,13 @@ Click the terminal button in the channel header to open it.
 ### High-availability clusters
 
 In a cluster, a **Node** dropdown appears next to the shell picker, listing the
-nodes from `/api/v4/cluster/status`. "Any (load balanced)" keeps the old
-behavior: the shell runs on whichever node the load balancer picks.
+connected nodes from `/api/v4/cluster/status`. The first node is selected by
+default; after that, the panel opens on the node you picked last (remembered
+per browser, by node ID and, since IDs change when a node restarts, by host
+name).
 
-When a specific node is chosen, the browser's WebSocket still lands on whichever
-node the load balancer picks (the *edge*), and the shell runs on the chosen node
-(the *target*). The two exchange keystrokes and output over plugin cluster
+The browser's WebSocket lands on whichever node the load balancer picks (the
+*edge*), and the shell runs on the chosen node (the *target*). The two exchange keystrokes and output over plugin cluster
 events addressed to one node (`PublishPluginClusterEvent` with a `TargetId`), so
 nothing is broadcast to the rest of the cluster and no extra network access
 between nodes is needed. Messages carry sequence numbers so order is restored
