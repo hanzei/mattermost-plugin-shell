@@ -5,7 +5,7 @@
     "homepage_url": "https://github.com/hanzei/mattermost-plugin-shell",
     "support_url": "https://github.com/hanzei/mattermost-plugin-shell/issues",
     "icon_path": "assets/starter-template-icon.svg",
-    "min_server_version": "6.2.1",
+    "min_server_version": "12.2.0",
     "server": {
         "executables": {
             "linux-amd64": "server/dist/plugin-linux-amd64",

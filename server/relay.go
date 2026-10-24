@@ -19,18 +19,17 @@ type frameSocket interface {
 	Close() error
 }
 
-// link is what both halves of a relayed session share: the session, this
-// node, the node on the other end, and when that node was last heard from.
+// link is what both halves of a relayed session share: the session, the node
+// on the other end, and when that node was last heard from.
 type link struct {
 	sid      string
-	self     string
 	peer     string
 	lastSeen atomic.Int64 // unix nanos
 }
 
 // msg returns an envelope of the given type for this session.
 func (l *link) msg(typ string) *clusterMessage {
-	return &clusterMessage{Type: typ, From: l.self, SID: l.sid}
+	return &clusterMessage{Type: typ, SID: l.sid}
 }
 
 func (l *link) touch() { l.lastSeen.Store(time.Now().UnixNano()) }
@@ -59,7 +58,7 @@ type targetSession struct {
 // relay runs both halves of remote terminals: edge sessions (socket here, shell
 // elsewhere) and target sessions (shell here, socket elsewhere).
 type relay struct {
-	// publish sends msg to the node target. msg.From is already set.
+	// publish sends msg to the node target.
 	publish func(target string, msg *clusterMessage) error
 	// allowed reports whether the user may use the terminal.
 	allowed func(userID string) bool
@@ -195,19 +194,18 @@ func (r *relay) request(target string, msg *clusterMessage) (*clusterMessage, er
 	}
 }
 
-// reply answers req, sending from the node req was addressed to.
-func (r *relay) reply(req, resp *clusterMessage) {
+// reply answers req, which the node from sent.
+func (r *relay) reply(from string, req, resp *clusterMessage) {
 	resp.Type = msgReply
 	resp.ReqID = req.ReqID
-	resp.From = req.To
-	if err := r.publish(req.From, resp); err != nil {
-		r.logWarn("Failed to send cluster reply", "node", req.From, "error", err.Error())
+	if err := r.publish(from, resp); err != nil {
+		r.logWarn("Failed to send cluster reply", "node", from, "error", err.Error())
 	}
 }
 
 // remoteShells asks target for its shells and the user's selection.
-func (r *relay) remoteShells(self, target, userID string) ([]shellInfo, string, error) {
-	resp, err := r.request(target, &clusterMessage{Type: msgShells, From: self, To: target, UserID: userID})
+func (r *relay) remoteShells(target, userID string) ([]shellInfo, string, error) {
+	resp, err := r.request(target, &clusterMessage{Type: msgShells, UserID: userID})
 	if err != nil {
 		return nil, "", err
 	}
@@ -217,9 +215,9 @@ func (r *relay) remoteShells(self, target, userID string) ([]shellInfo, string, 
 // openEdge starts a shell on target for a websocket on this node. The session
 // receives output as soon as it is registered, so the caller must already have
 // upgraded the socket. On failure the browser has been told why.
-func (r *relay) openEdge(sock frameSocket, self, target, userID, shell string) (*edgeSession, string, error) {
+func (r *relay) openEdge(sock frameSocket, target, userID, shell string) (*edgeSession, string, error) {
 	es := &edgeSession{
-		link: link{sid: model.NewId(), self: self, peer: target},
+		link: link{sid: model.NewId(), peer: target},
 		sock: sock,
 		out:  newSequencer(),
 	}
@@ -234,9 +232,7 @@ func (r *relay) openEdge(sock frameSocket, self, target, userID, shell string) (
 		return nil, "", errors.New("the plugin is shutting down")
 	}
 
-	resp, err := r.request(target, &clusterMessage{
-		Type: msgOpen, From: self, To: target, SID: es.sid, UserID: userID, Shell: shell,
-	})
+	resp, err := r.request(target, &clusterMessage{Type: msgOpen, SID: es.sid, UserID: userID, Shell: shell})
 	if err != nil {
 		r.endEdge(es, "failed to start shell on node "+target+": "+err.Error(), false)
 		return nil, "", err
@@ -319,8 +315,8 @@ func (r *relay) dropTarget(sid string) bool {
 	return ok
 }
 
-// handle dispatches one envelope from another node.
-func (r *relay) handle(msg *clusterMessage) {
+// handle dispatches one envelope from the node from.
+func (r *relay) handle(from string, msg *clusterMessage) {
 	r.mu.Lock()
 	closed := r.closed
 	r.mu.Unlock()
@@ -340,28 +336,30 @@ func (r *relay) handle(msg *clusterMessage) {
 			}
 		}
 	case msgShells:
-		r.handleShells(msg)
+		r.handleShells(from, msg)
 	case msgOpen:
-		r.handleOpen(msg)
+		r.handleOpen(from, msg)
 	case msgClose:
-		r.handleClose(msg)
+		r.handleClose(from, msg)
 	case msgInput, msgOutput, msgEnd, msgPing:
-		r.handleSession(msg)
+		r.handleSession(from, msg)
 	}
 }
 
 // handleSession routes a message for an existing session and notes that its
-// peer is alive. A message for a session this node doesn't have means the
-// sender outlived its partner here, e.g. an open that timed out on the edge
-// after the target started the shell, or a plugin restart, so the sender is
-// told to end it.
-func (r *relay) handleSession(msg *clusterMessage) {
+// peer is alive. Messages from any other node are ignored. A message for a
+// session this node doesn't have means the sender outlived its partner here,
+// e.g. an open that timed out on the edge after the target started the shell,
+// or a plugin restart, so the sender is told to end it.
+func (r *relay) handleSession(from string, msg *clusterMessage) {
 	r.mu.Lock()
 	es := r.edges[msg.SID]
 	ts := r.targets[msg.SID]
 	r.mu.Unlock()
 
 	switch {
+	case es != nil && es.peer != from, ts != nil && ts.peer != from:
+		return
 	case es != nil:
 		es.touch()
 		if msg.Type == msgOutput || msg.Type == msgEnd {
@@ -373,28 +371,28 @@ func (r *relay) handleSession(msg *clusterMessage) {
 			r.handleInput(ts, msg)
 		}
 	case msg.Type != msgEnd:
-		_ = r.publish(msg.From, &clusterMessage{Type: msgClose, SID: msg.SID})
+		_ = r.publish(from, &clusterMessage{Type: msgClose, SID: msg.SID})
 	}
 }
 
-func (r *relay) handleShells(msg *clusterMessage) {
+func (r *relay) handleShells(from string, msg *clusterMessage) {
 	if !r.allowed(msg.UserID) {
-		r.reply(msg, &clusterMessage{Error: errForbidden.Error()})
+		r.reply(from, msg, &clusterMessage{Error: errForbidden.Error()})
 		return
 	}
 	shells, selected := r.shells(msg.UserID)
-	r.reply(msg, &clusterMessage{Shells: shells, Selected: selected})
+	r.reply(from, msg, &clusterMessage{Shells: shells, Selected: selected})
 }
 
-// handleOpen starts a shell here for a websocket on msg.From.
-func (r *relay) handleOpen(msg *clusterMessage) {
-	if msg.SID == "" || msg.To == "" {
-		r.reply(msg, &clusterMessage{Error: "invalid open request"})
+// handleOpen starts a shell here for a websocket on the node from.
+func (r *relay) handleOpen(from string, msg *clusterMessage) {
+	if msg.SID == "" {
+		r.reply(from, msg, &clusterMessage{Error: "invalid open request"})
 		return
 	}
 	// The edge already checked, but this node decides what runs on it.
 	if !r.allowed(msg.UserID) {
-		r.reply(msg, &clusterMessage{Error: errForbidden.Error()})
+		r.reply(from, msg, &clusterMessage{Error: errForbidden.Error()})
 		return
 	}
 	if !r.canRegisterTarget(msg.SID) {
@@ -403,12 +401,12 @@ func (r *relay) handleOpen(msg *clusterMessage) {
 
 	term, shell, err := r.spawn(msg.UserID, msg.Shell)
 	if err != nil {
-		r.reply(msg, &clusterMessage{Error: "failed to start shell: " + err.Error()})
+		r.reply(from, msg, &clusterMessage{Error: "failed to start shell: " + err.Error()})
 		return
 	}
 
 	ts := &targetSession{
-		link: link{sid: msg.SID, self: msg.To, peer: msg.From},
+		link: link{sid: msg.SID, peer: from},
 		term: term,
 		in:   newSequencer(),
 	}
@@ -425,7 +423,7 @@ func (r *relay) handleOpen(msg *clusterMessage) {
 		return
 	}
 
-	r.reply(msg, &clusterMessage{SID: ts.sid, Shell: shell.Name})
+	r.reply(from, msg, &clusterMessage{SID: ts.sid, Shell: shell.Name})
 	go r.pumpOutput(ts)
 }
 
@@ -537,15 +535,19 @@ func (r *relay) handleStream(es *edgeSession, msg *clusterMessage) {
 	}
 }
 
-// handleClose ends whichever half of the session lives here, right away.
-func (r *relay) handleClose(msg *clusterMessage) {
+// handleClose ends whichever half of the session lives here, right away, if
+// the close came from its peer.
+func (r *relay) handleClose(from string, msg *clusterMessage) {
 	r.mu.Lock()
 	es := r.edges[msg.SID]
+	ts := r.targets[msg.SID]
 	r.mu.Unlock()
-	if es != nil {
+	if es != nil && es.peer == from {
 		r.endEdge(es, "", false)
 	}
-	r.dropTarget(msg.SID)
+	if ts != nil && ts.peer == from {
+		r.endTarget(ts, false)
+	}
 }
 
 // closeAll ends every session on deactivation, tells the other nodes and

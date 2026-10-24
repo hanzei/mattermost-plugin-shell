@@ -3,10 +3,6 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
-	"net"
-	"os"
-	"strconv"
 	"time"
 
 	"github.com/mattermost/mattermost/server/public/model"
@@ -23,6 +19,10 @@ import (
 //
 //	browser <-ws-> edge --open/input/close-----> target (PTY)
 //	               edge <--output/end/close----- target
+//
+// Each node knows its own cluster ID (GetNodeID), and the server tells the
+// receiver which node sent each event (PluginClusterEvent.SourceId), so the
+// envelope carries no addresses.
 //
 // Input and output are one-way streams; only open and shell listing wait for a
 // reply. The reliable cluster channel doesn't keep order: Mattermost Enterprise
@@ -60,8 +60,6 @@ const (
 // clusterMessage is the envelope carried in PluginClusterEvent.Data.
 type clusterMessage struct {
 	Type  string `json:"type"`
-	From  string `json:"from"`             // sender's cluster node ID, so the receiver can answer
-	To    string `json:"to,omitempty"`     // addressee's node ID, on requests; the target learns its own ID from it
 	ReqID string `json:"req_id,omitempty"` // set on requests and their replies
 	SID   string `json:"sid,omitempty"`    // terminal session
 	Seq   uint64 `json:"seq,omitempty"`
@@ -76,109 +74,25 @@ type clusterMessage struct {
 	Selected string      `json:"selected,omitempty"`
 }
 
-// clusterNode is one entry of /api/v4/cluster/status, which the webapp passes
-// along as the "nodes" query parameter.
-type clusterNode struct {
-	ID        string `json:"id"`
-	Hostname  string `json:"hostname"`
-	IPAddress string `json:"ipaddress"` // gossip address, ip:port
-}
-
-// localIdentity is what this host knows about itself, to find itself in the
-// node list.
-type localIdentity struct {
-	names      map[string]bool // host name, configured override/advertise names
-	ips        map[string]bool // local interface addresses
-	gossipPort string
-}
-
-// splitHost strips an optional port from addr.
-func splitHost(addr string) (host, port string) {
-	if h, p, err := net.SplitHostPort(addr); err == nil {
-		return h, p
+// routeFor decides whether a terminal for target runs on another node, given
+// this node's cluster ID. An empty target means this node.
+func routeFor(target, self string) (remote bool, err error) {
+	switch {
+	case target == "":
+		return false, nil
+	case self == "":
+		return false, errors.New("this server is not part of a cluster")
+	default:
+		return target != self, nil
 	}
-	return addr, ""
 }
 
-// selfNodeID finds this node in the cluster's node list. The plugin API can't
-// report the node ID yet, so it matches what the cluster advertises for each
-// node: first the gossip address against local interfaces and the gossip port
-// (which also tells apart nodes sharing a host), then the advertised name,
-// which is the host name, an IP or ClusterSettings.OverrideHostname.
-func selfNodeID(nodes []clusterNode, local localIdentity) (string, error) {
-	var byAddr, byName []string
-	for _, n := range nodes {
-		if ip, port := splitHost(n.IPAddress); local.ips[ip] && (local.gossipPort == "" || port == local.gossipPort) {
-			byAddr = append(byAddr, n.ID)
-		}
-		if name, _ := splitHost(n.Hostname); local.names[name] || local.ips[name] {
-			byName = append(byName, n.ID)
-		}
-	}
-	for _, matches := range [][]string{byAddr, byName} {
-		switch len(matches) {
-		case 0:
-			continue
-		case 1:
-			return matches[0], nil
-		default:
-			return "", errors.New("several cluster nodes match this host")
-		}
-	}
-	return "", errors.New("this host does not match any cluster node")
-}
-
-// resolveRoute decides whether a request for target runs locally. It returns
-// the local node ID when the session must be relayed.
-func resolveRoute(target string, nodes []clusterNode, local localIdentity) (self string, remote bool, err error) {
+// route decides whether a terminal for target runs on another node.
+func (p *Plugin) route(target string) (remote bool, err error) {
 	if target == "" {
-		return "", false, nil
+		return false, nil
 	}
-	self, err = selfNodeID(nodes, local)
-	if err != nil {
-		return "", false, fmt.Errorf("could not identify this node in the cluster node list: %w", err)
-	}
-	return self, self != target, nil
-}
-
-// clusterRoute reads the node and nodes query parameters for a request.
-func (p *Plugin) clusterRoute(target, rawNodes string) (self string, remote bool, err error) {
-	if target == "" {
-		return "", false, nil
-	}
-	var nodes []clusterNode
-	if err := json.Unmarshal([]byte(rawNodes), &nodes); err != nil {
-		return "", false, fmt.Errorf("invalid nodes parameter: %w", err)
-	}
-	return resolveRoute(target, nodes, p.localIdentity())
-}
-
-// localIdentity collects this host's names and addresses.
-func (p *Plugin) localIdentity() localIdentity {
-	local := localIdentity{names: make(map[string]bool), ips: make(map[string]bool)}
-	if hostname, err := os.Hostname(); err == nil {
-		local.names[hostname] = true
-	}
-	if addrs, err := net.InterfaceAddrs(); err == nil {
-		for _, addr := range addrs {
-			if ipNet, ok := addr.(*net.IPNet); ok {
-				local.ips[ipNet.IP.String()] = true
-			}
-		}
-	}
-	if cfg := p.client.Configuration.GetConfig(); cfg != nil {
-		cs := cfg.ClusterSettings
-		for _, name := range []*string{cs.OverrideHostname, cs.AdvertiseAddress} {
-			if name != nil && *name != "" {
-				host, _ := splitHost(*name)
-				local.names[host] = true
-			}
-		}
-		if cs.GossipPort != nil {
-			local.gossipPort = strconv.Itoa(*cs.GossipPort)
-		}
-	}
-	return local
+	return routeFor(target, p.client.Cluster.GetNodeID())
 }
 
 // sequencer releases messages in sequence order, holding back any that arrive
@@ -237,10 +151,14 @@ func (p *Plugin) OnPluginClusterEvent(_ *plugin.Context, ev model.PluginClusterE
 	if ev.Id != clusterEventID || p.relay == nil {
 		return
 	}
+	if ev.SourceId == "" {
+		p.API.LogWarn("Dropping cluster message with no sender")
+		return
+	}
 	var msg clusterMessage
 	if err := json.Unmarshal(ev.Data, &msg); err != nil {
 		p.API.LogWarn("Dropping malformed cluster message", "error", err.Error())
 		return
 	}
-	p.relay.handle(&msg)
+	p.relay.handle(ev.SourceId, &msg)
 }

@@ -42,25 +42,24 @@ Click the terminal button in the channel header to open it.
 
 ### High-availability clusters
 
+The plugin requires Mattermost 12.2 or later, which tells plugins their own
+cluster node ID and which node sent each cluster event.
+
 In a cluster, a **Node** dropdown appears next to the shell picker, listing the
-connected nodes from `/api/v4/cluster/status`. The first node is selected by
+connected cluster nodes. The first node is selected by
 default; after that, the panel opens on the node you picked last (remembered
 per browser, by node ID and, since IDs change when a node restarts, by gossip
 address and host name).
 
 The browser's WebSocket lands on whichever node the load balancer picks (the
-*edge*), and the shell runs on the chosen node (the *target*). The two exchange keystrokes and output over plugin cluster
-events addressed to one node (`PublishPluginClusterEvent` with a `TargetId`), so
-nothing is broadcast to the rest of the cluster and no extra network access
-between nodes is needed. Messages carry sequence numbers so order is restored
-whatever the cluster transport guarantees. The target node re-checks that the
-user is a system admin before it starts a shell.
-
-The plugin API can't tell a node its own cluster ID yet, so the webapp sends
-the node list with the request and the edge finds itself in it: first by its
-gossip address (local interface IP plus `ClusterSettings.GossipPort`), then by
-the advertised name (host name, IP or `OverrideHostname`). If nothing matches,
-or several nodes do, the request fails with an error.
+*edge*), and the shell runs on the chosen node (the *target*). The two
+exchange keystrokes and output over plugin cluster events addressed to one node
+(`PublishPluginClusterEvent` with a `TargetId`), so nothing is broadcast to the
+rest of the cluster and no extra network access between nodes is needed.
+Messages carry sequence numbers so order is restored whatever the cluster
+transport guarantees, and each node only accepts a session's messages from that
+session's peer. The target node re-checks that the user is a system admin
+before it starts a shell.
 
 Both sides of a session ping each other every 10 seconds. If one side hears
 nothing for 30 seconds, or can't reach the other node at all, it ends the

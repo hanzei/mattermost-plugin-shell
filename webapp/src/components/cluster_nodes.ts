@@ -5,7 +5,7 @@ import manifest from 'manifest';
 
 import type {ClusterInfo} from '@mattermost/types/admin';
 
-// The parts of a /api/v4/cluster/status entry the plugin uses.
+// A connected cluster node, as the plugin's /nodes endpoint lists it.
 export type ClusterNode = Pick<ClusterInfo, 'id' | 'hostname' | 'ipaddress'>;
 
 // The last node picked, kept per browser. Node IDs change when a node

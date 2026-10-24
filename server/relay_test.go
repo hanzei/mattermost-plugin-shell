@@ -63,7 +63,7 @@ func (c *fakeCluster) add(id string, r *relay) {
 		go func() {
 			var copied clusterMessage
 			if err := json.Unmarshal(data, &copied); err == nil {
-				dst.handle(&copied)
+				dst.handle(id, &copied)
 			}
 		}()
 		return nil
@@ -146,7 +146,7 @@ func TestRelayRoundTrip(t *testing.T) {
 	edge, target, _ := newTestCluster(t, spawnCommand("cat"))
 	sock := &fakeSocket{}
 
-	es, shell, err := edge.openEdge(sock, "a", "b", "admin", "")
+	es, shell, err := edge.openEdge(sock, "b", "admin", "")
 	require.NoError(t, err)
 	assert.Equal(t, "cat", shell)
 
@@ -174,7 +174,7 @@ func TestRelayShellExitClosesSocketAfterOutput(t *testing.T) {
 	edge, target, _ := newTestCluster(t, spawnCommand("sh", "-c", "printf 'one two three'"))
 	sock := &fakeSocket{}
 
-	_, _, err := edge.openEdge(sock, "a", "b", "admin", "")
+	_, _, err := edge.openEdge(sock, "b", "admin", "")
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
@@ -197,7 +197,7 @@ func TestRelayOpenForbidden(t *testing.T) {
 		return nil, shellInfo{}, errors.New("unreachable")
 	})
 
-	_, _, err := edge.openEdge(&fakeSocket{}, "a", "b", "someone", "")
+	_, _, err := edge.openEdge(&fakeSocket{}, "b", "someone", "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "forbidden")
 	assert.False(t, spawned)
@@ -210,7 +210,7 @@ func TestRelayOpenSpawnError(t *testing.T) {
 		return nil, shellInfo{}, errors.New("no supported shell found on the host")
 	})
 
-	_, _, err := edge.openEdge(&fakeSocket{}, "a", "b", "admin", "")
+	_, _, err := edge.openEdge(&fakeSocket{}, "b", "admin", "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no supported shell")
 }
@@ -218,7 +218,7 @@ func TestRelayOpenSpawnError(t *testing.T) {
 func TestRelayOpenUnknownNode(t *testing.T) {
 	edge, _, _ := newTestCluster(t, spawnCommand("cat"))
 
-	_, _, err := edge.openEdge(&fakeSocket{}, "a", "nope", "admin", "")
+	_, _, err := edge.openEdge(&fakeSocket{}, "nope", "admin", "")
 	require.Error(t, err)
 	edges, _ := sessionCounts(edge)
 	assert.Zero(t, edges)
@@ -227,12 +227,12 @@ func TestRelayOpenUnknownNode(t *testing.T) {
 func TestRelayRemoteShells(t *testing.T) {
 	edge, _, _ := newTestCluster(t, nil)
 
-	shells, selected, err := edge.remoteShells("a", "b", "admin")
+	shells, selected, err := edge.remoteShells("b", "admin")
 	require.NoError(t, err)
 	assert.Len(t, shells, 2)
 	assert.Equal(t, "zsh", selected)
 
-	_, _, err = edge.remoteShells("a", "b", "someone")
+	_, _, err = edge.remoteShells("b", "someone")
 	require.Error(t, err)
 }
 
@@ -240,7 +240,7 @@ func TestRelayCloseAll(t *testing.T) {
 	edge, target, _ := newTestCluster(t, spawnCommand("cat"))
 	sock := &fakeSocket{}
 
-	_, _, err := edge.openEdge(sock, "a", "b", "admin", "")
+	_, _, err := edge.openEdge(sock, "b", "admin", "")
 	require.NoError(t, err)
 
 	// Deactivating the target node ends the shell and closes the browser socket.
@@ -258,7 +258,7 @@ func TestRelayOrphanedShellIsClosed(t *testing.T) {
 
 	// An open arriving at the target with no edge session waiting for it, as
 	// when the edge's request timed out first.
-	target.handle(&clusterMessage{Type: msgOpen, From: "a", To: "b", SID: model.NewId(), UserID: "admin"})
+	target.handle("a", &clusterMessage{Type: msgOpen, SID: model.NewId(), UserID: "admin"})
 
 	// Its first output reaches the edge, which knows no such session and tells
 	// the target to end it.
@@ -274,7 +274,7 @@ func TestRelayIdleSessionStaysOpen(t *testing.T) {
 	edge, target, _ := newTestCluster(t, spawnCommand("cat"))
 	sock := &fakeSocket{}
 
-	_, _, err := edge.openEdge(sock, "a", "b", "admin", "")
+	_, _, err := edge.openEdge(sock, "b", "admin", "")
 	require.NoError(t, err)
 
 	// Several timeouts pass with no input or output; the pings keep it alive.
@@ -301,7 +301,7 @@ func TestRelayPeerFailure(t *testing.T) {
 			edge, target, c := newTestCluster(t, spawnCommand("cat"))
 			sock := &fakeSocket{}
 
-			_, _, err := edge.openEdge(sock, "a", "b", "admin", "")
+			_, _, err := edge.openEdge(sock, "b", "admin", "")
 			require.NoError(t, err)
 
 			tt.fail(c)
@@ -328,7 +328,7 @@ func TestRelayPeerFailure(t *testing.T) {
 func TestRelayEdgeFailureEndsShell(t *testing.T) {
 	edge, target, c := newTestCluster(t, spawnCommand("cat"))
 
-	_, _, err := edge.openEdge(&fakeSocket{}, "a", "b", "admin", "")
+	_, _, err := edge.openEdge(&fakeSocket{}, "b", "admin", "")
 	require.NoError(t, err)
 
 	c.partition("a")
@@ -343,7 +343,7 @@ func TestRelayPingForUnknownSessionCloses(t *testing.T) {
 	edge, target, _ := newTestCluster(t, spawnCommand("cat"))
 	sock := &fakeSocket{}
 
-	es, _, err := edge.openEdge(sock, "a", "b", "admin", "")
+	es, _, err := edge.openEdge(sock, "b", "admin", "")
 	require.NoError(t, err)
 
 	// The edge forgets the session without telling the target, as after a
@@ -368,9 +368,9 @@ func TestRelayDuplicateOpenKeepsOneShell(t *testing.T) {
 		return term, info, err
 	})
 
-	open := &clusterMessage{Type: msgOpen, From: "a", To: "b", SID: model.NewId(), UserID: "admin"}
-	target.handle(open)
-	target.handle(open)
+	open := &clusterMessage{Type: msgOpen, SID: model.NewId(), UserID: "admin"}
+	target.handle("a", open)
+	target.handle("a", open)
 
 	_, targets := sessionCounts(target)
 	assert.Equal(t, 1, targets)
@@ -408,8 +408,8 @@ func TestRelayDuplicateReplyDoesNotBlock(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		r.handle(&clusterMessage{Type: msgReply, ReqID: "req"})
-		r.handle(&clusterMessage{Type: msgReply, ReqID: "req"})
+		r.handle("b", &clusterMessage{Type: msgReply, ReqID: "req"})
+		r.handle("b", &clusterMessage{Type: msgReply, ReqID: "req"})
 		close(done)
 	}()
 
@@ -429,7 +429,7 @@ func TestRelayIgnoresMessagesAfterClose(t *testing.T) {
 	})
 
 	target.closeAll()
-	target.handle(&clusterMessage{Type: msgOpen, From: "a", To: "b", SID: model.NewId(), UserID: "admin"})
+	target.handle("a", &clusterMessage{Type: msgOpen, SID: model.NewId(), UserID: "admin"})
 
 	assert.False(t, spawned)
 	_, targets := sessionCounts(target)
@@ -490,99 +490,52 @@ func TestCoalesce(t *testing.T) {
 	assert.Len(t, chunks, 1)
 }
 
-func TestSelfNodeID(t *testing.T) {
-	local := localIdentity{
-		names:      map[string]bool{"app-1": true},
-		ips:        map[string]bool{"10.0.0.1": true, "127.0.0.1": true},
-		gossipPort: "8074",
-	}
-
+func TestRouteFor(t *testing.T) {
 	tests := []struct {
-		name    string
-		nodes   []clusterNode
-		want    string
-		wantErr bool
+		name       string
+		target     string
+		self       string
+		wantRemote bool
+		wantErr    bool
 	}{
-		{
-			name: "default setup advertises the IP as host name",
-			nodes: []clusterNode{
-				{ID: "n1", Hostname: "10.0.0.1", IPAddress: "10.0.0.1:8074"},
-				{ID: "n2", Hostname: "10.0.0.2", IPAddress: "10.0.0.2:8074"},
-			},
-			want: "n1",
-		},
-		{
-			name: "gossip port tells apart nodes on one host",
-			nodes: []clusterNode{
-				{ID: "n1", Hostname: "127.0.0.1", IPAddress: "127.0.0.1:8075"},
-				{ID: "n2", Hostname: "127.0.0.1", IPAddress: "127.0.0.1:8074"},
-			},
-			want: "n2",
-		},
-		{
-			name: "falls back to the host name",
-			nodes: []clusterNode{
-				{ID: "n1", Hostname: "app-1"},
-				{ID: "n2", Hostname: "app-2"},
-			},
-			want: "n1",
-		},
-		{
-			name: "host name with port",
-			nodes: []clusterNode{
-				{ID: "n1", Hostname: "app-2:8074"},
-				{ID: "n2", Hostname: "app-1:8074"},
-			},
-			want: "n2",
-		},
-		{
-			name: "no match",
-			nodes: []clusterNode{
-				{ID: "n1", Hostname: "app-2", IPAddress: "10.0.0.2:8074"},
-			},
-			wantErr: true,
-		},
-		{
-			name: "ambiguous match",
-			nodes: []clusterNode{
-				{ID: "n1", Hostname: "app-1"},
-				{ID: "n2", Hostname: "app-1"},
-			},
-			wantErr: true,
-		},
+		{name: "no node requested runs locally", self: "n1"},
+		{name: "no node requested on a single server runs locally"},
+		{name: "this node runs locally", target: "n1", self: "n1"},
+		{name: "other node is relayed", target: "n2", self: "n1", wantRemote: true},
+		{name: "a node requested outside a cluster is an error", target: "n2", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := selfNodeID(tt.nodes, local)
+			remote, err := routeFor(tt.target, tt.self)
 			if tt.wantErr {
 				assert.Error(t, err)
 				return
 			}
 			require.NoError(t, err)
-			assert.Equal(t, tt.want, got)
+			assert.Equal(t, tt.wantRemote, remote)
 		})
 	}
 }
 
-func TestResolveRoute(t *testing.T) {
-	nodes := []clusterNode{{ID: "n1", Hostname: "host-a"}, {ID: "n2", Hostname: "host-b"}}
-	local := localIdentity{names: map[string]bool{"host-a": true}}
+func TestRelayIgnoresMessagesFromOtherNodes(t *testing.T) {
+	edge, target, c := newTestCluster(t, spawnCommand("cat"))
+	third := newTestRelay(t, nil)
+	c.add("c", third)
+	sock := &fakeSocket{}
 
-	self, remote, err := resolveRoute("", nil, local)
+	es, _, err := edge.openEdge(sock, "b", "admin", "")
 	require.NoError(t, err)
-	assert.Empty(t, self)
-	assert.False(t, remote, "no node requested runs locally")
 
-	self, remote, err = resolveRoute("n1", nodes, local)
-	require.NoError(t, err)
-	assert.Equal(t, "n1", self)
-	assert.False(t, remote, "this node runs locally")
+	// Node c is not part of this session: its close and output are ignored.
+	edge.handle("c", &clusterMessage{Type: msgClose, SID: es.sid})
+	edge.handle("c", &clusterMessage{Type: msgOutput, SID: es.sid, Data: []byte("spoofed")})
+	target.handle("c", &clusterMessage{Type: msgClose, SID: es.sid})
 
-	self, remote, err = resolveRoute("n2", nodes, local)
-	require.NoError(t, err)
-	assert.Equal(t, "n1", self)
-	assert.True(t, remote, "other node is relayed")
-
-	_, _, err = resolveRoute("n2", nil, local)
-	assert.Error(t, err, "missing node list")
+	edges, _ := sessionCounts(edge)
+	_, targets := sessionCounts(target)
+	assert.Equal(t, 1, edges)
+	assert.Equal(t, 1, targets)
+	out, closed := sock.state()
+	assert.False(t, closed)
+	assert.NotContains(t, out, "spoofed")
 }

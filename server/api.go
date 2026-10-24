@@ -22,6 +22,9 @@ func (p *Plugin) initRouter() *mux.Router {
 	// Lists shells available on the host plus the caller's current selection.
 	apiRouter.HandleFunc("/shells", p.handleShells).Methods(http.MethodGet)
 
+	// Lists the cluster nodes a terminal can run on.
+	apiRouter.HandleFunc("/nodes", p.handleNodes).Methods(http.MethodGet)
+
 	return router
 }
 

@@ -246,7 +246,7 @@ func (p *Plugin) handleTerminal(w http.ResponseWriter, r *http.Request) {
 
 	query := r.URL.Query()
 	target, shell := query.Get("node"), query.Get("shell")
-	self, remote, err := p.clusterRoute(target, query.Get("nodes"))
+	remote, err := p.route(target)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -263,7 +263,7 @@ func (p *Plugin) handleTerminal(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = conn.Close() }()
 
 	if remote {
-		p.relayTerminal(conn, userID, self, target, shell)
+		p.relayTerminal(conn, userID, target, shell)
 	} else {
 		p.localTerminal(conn, userID, shell)
 	}
@@ -304,8 +304,8 @@ func (p *Plugin) localTerminal(conn *websocket.Conn, userID, requested string) {
 // relayTerminal serves a terminal whose shell runs on another cluster node. The
 // browser socket stays here; input goes to the target and its output comes back
 // through the relay.
-func (p *Plugin) relayTerminal(conn *websocket.Conn, userID, self, target, shell string) {
-	es, shellName, err := p.relay.openEdge(conn, self, target, userID, shell)
+func (p *Plugin) relayTerminal(conn *websocket.Conn, userID, target, shell string) {
+	es, shellName, err := p.relay.openEdge(conn, target, userID, shell)
 	if err != nil {
 		// openEdge already told the browser.
 		p.API.LogError("Failed to open remote terminal", "node", target, "error", err.Error())
@@ -442,7 +442,7 @@ func (p *Plugin) handleShells(w http.ResponseWriter, r *http.Request) {
 
 	query := r.URL.Query()
 	target := query.Get("node")
-	self, remote, err := p.clusterRoute(target, query.Get("nodes"))
+	remote, err := p.route(target)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -453,7 +453,7 @@ func (p *Plugin) handleShells(w http.ResponseWriter, r *http.Request) {
 		Selected string      `json:"selected"`
 	}
 	if remote {
-		resp.Shells, resp.Selected, err = p.relay.remoteShells(self, target, userID)
+		resp.Shells, resp.Selected, err = p.relay.remoteShells(target, userID)
 		if err != nil {
 			http.Error(w, "Failed to list shells on node: "+err.Error(), http.StatusBadGateway)
 			return
@@ -465,6 +465,37 @@ func (p *Plugin) handleShells(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		p.API.LogError("Failed to encode shells response", "error", err.Error())
+	}
+}
+
+// handleNodes lists the nodes a terminal can run on: the connected cluster
+// nodes, or none when this server isn't part of a cluster. System-admin only,
+// like the terminal.
+func (p *Plugin) handleNodes(w http.ResponseWriter, r *http.Request) {
+	if !p.isAdmin(r.Header.Get("Mattermost-User-ID")) {
+		http.Error(w, "Forbidden: system administrator required", http.StatusForbidden)
+		return
+	}
+
+	infos, err := p.client.Cluster.GetNodes()
+	if err != nil {
+		p.API.LogError("Failed to list cluster nodes", "error", err.Error())
+		http.Error(w, "Failed to list cluster nodes", http.StatusInternalServerError)
+		return
+	}
+	type node struct {
+		ID        string `json:"id"`
+		Hostname  string `json:"hostname"`
+		IPAddress string `json:"ipaddress"`
+	}
+	nodes := make([]node, 0, len(infos))
+	for _, info := range infos {
+		nodes = append(nodes, node{ID: info.Id, Hostname: info.Hostname, IPAddress: info.IPAddress})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(nodes); err != nil {
+		p.API.LogError("Failed to encode nodes response", "error", err.Error())
 	}
 }
 

@@ -27,13 +27,11 @@ function pluginURL(path: string, params?: URLSearchParams): string {
     return `/plugins/${manifest.id}/api/v1/${path}${query}`;
 }
 
-// routeParams asks the plugin to run on a specific cluster node. The node list
-// lets the receiving node recognize itself, which the plugin API can't tell it.
-function routeParams(node: string, nodes: ClusterNode[]): URLSearchParams {
+// routeParams asks the plugin to run on a specific cluster node.
+function routeParams(node: string): URLSearchParams {
     const params = new URLSearchParams();
     if (node) {
         params.set('node', node);
-        params.set('nodes', JSON.stringify(nodes));
     }
     return params;
 }
@@ -130,34 +128,26 @@ const HostTerminal: React.FC = () => {
         };
     }, [send, fitAndResize]);
 
-    // Load the cluster's nodes. Single servers return an empty list.
+    // Load the connected cluster nodes. Single servers return an empty list.
     useEffect(() => {
         let cancelled = false;
-        fetch('/api/v4/cluster/status', {
-            credentials: 'same-origin',
-            headers: {'X-Requested-With': 'XMLHttpRequest'},
-        }).
+        fetch(pluginURL('nodes'), {credentials: 'same-origin'}).
             then((res) => (res.ok ? res.json() : [])).
             then((data: ClusterNode[]) => {
                 if (cancelled) {
                     return;
                 }
-
-                // Nodes without an address are registered but not connected,
-                // so a shell can't run on them.
-                const connected = (Array.isArray(data) ? data : []).
-                    filter((n) => n.ipaddress).
-                    map(({id, hostname, ipaddress}) => ({id, hostname, ipaddress})).
+                const sorted = (Array.isArray(data) ? data : []).
                     sort((a, b) => a.hostname.localeCompare(b.hostname));
-                if (connected.length < 2) {
+                if (sorted.length < 2) {
                     setNode('');
                     return;
                 }
-                setNodes(connected);
-                setNode(pickNode(connected).id);
+                setNodes(sorted);
+                setNode(pickNode(sorted).id);
             }).
             catch(() => {
-                // Not a cluster, or no permission: the node picker stays hidden.
+                // The node picker stays hidden.
                 if (!cancelled) {
                     setNode('');
                 }
@@ -173,7 +163,7 @@ const HostTerminal: React.FC = () => {
             return undefined; // wait for the node list
         }
         let cancelled = false;
-        fetch(pluginURL('shells', routeParams(node, nodes)), {credentials: 'same-origin'}).
+        fetch(pluginURL('shells', routeParams(node)), {credentials: 'same-origin'}).
             then((res) => res.json()).
             then((data: ShellsResponse) => {
                 if (cancelled) {
@@ -190,7 +180,7 @@ const HostTerminal: React.FC = () => {
         return () => {
             cancelled = true;
         };
-    }, [node, nodes]);
+    }, [node]);
 
     // Connect the socket once a target is known; reconnect when it changes.
     useEffect(() => {
@@ -207,7 +197,7 @@ const HostTerminal: React.FC = () => {
 
         let opened = false;
         let failed = false;
-        const socket = new WebSocket(terminalSocketURL(target.shell, routeParams(target.node, nodes)));
+        const socket = new WebSocket(terminalSocketURL(target.shell, routeParams(target.node)));
         socket.binaryType = 'arraybuffer';
         socketRef.current = socket;
 
@@ -245,7 +235,7 @@ const HostTerminal: React.FC = () => {
             socket.close();
             socketRef.current = null;
         };
-    }, [target, nodes, send]);
+    }, [target, send]);
 
     const nodeName = nodes.find((n) => n.id === target?.node)?.hostname;
 
