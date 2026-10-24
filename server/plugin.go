@@ -29,6 +29,10 @@ type Plugin struct {
 	// torn down on deactivation.
 	terminals *sessionManager
 
+	// relay carries terminals whose browser socket and shell are on different
+	// cluster nodes.
+	relay *relay
+
 	// configurationLock synchronizes access to the configuration.
 	configurationLock sync.RWMutex
 
@@ -47,6 +51,15 @@ func (p *Plugin) OnActivate() error {
 
 	p.terminals = newSessionManager()
 
+	p.relay = newRelay()
+	p.relay.publish = p.publishCluster
+	p.relay.allowed = func(userID string) bool {
+		return p.client.User.HasPermissionTo(userID, model.PermissionManageSystem)
+	}
+	p.relay.spawn = p.startShell
+	p.relay.shells = p.localShells
+	p.relay.logWarn = p.API.LogWarn
+
 	return nil
 }
 
@@ -54,6 +67,9 @@ func (p *Plugin) OnActivate() error {
 func (p *Plugin) OnDeactivate() error {
 	if p.terminals != nil {
 		p.terminals.closeAll()
+	}
+	if p.relay != nil {
+		p.relay.closeAll()
 	}
 	return nil
 }

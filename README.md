@@ -40,6 +40,29 @@ Click the terminal button in the channel header to open it.
   resize events are sent as JSON control messages.
 - Live sessions are tracked and killed when the plugin is deactivated.
 
+### High-availability clusters
+
+In a cluster, a **Node** dropdown appears next to the shell picker, listing the
+nodes from `/api/v4/cluster/status`. "Any (load balanced)" keeps the old
+behavior: the shell runs on whichever node the load balancer picks.
+
+When a specific node is chosen, the browser's WebSocket still lands on whichever
+node the load balancer picks (the *edge*), and the shell runs on the chosen node
+(the *target*). The two exchange keystrokes and output over plugin cluster
+events addressed to one node (`PublishPluginClusterEvent` with a `TargetId`), so
+nothing is broadcast to the rest of the cluster and no extra network access
+between nodes is needed. Messages carry sequence numbers so order is restored
+whatever the cluster transport guarantees. The target node re-checks that the
+user is a system admin before it starts a shell.
+
+The plugin API can't tell a node its own cluster ID yet, so the webapp sends
+the node list with the request and the edge finds itself by host name. If the
+host name doesn't match any node, the request fails with an error.
+
+Known limits: if the target node dies, the terminal stays open until it is
+closed, and `/exec` and `/inspect` still run on whichever node receives the
+command.
+
 ## Slash commands
 
 For one-off use without opening the terminal. Both are restricted to **system
