@@ -59,6 +59,7 @@ func (p *Plugin) OnActivate() error {
 	p.relay.spawn = p.startShell
 	p.relay.shells = p.localShells
 	p.relay.logWarn = p.API.LogWarn
+	p.relay.start()
 
 	return nil
 }

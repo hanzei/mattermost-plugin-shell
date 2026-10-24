@@ -61,8 +61,13 @@ gossip address (local interface IP plus `ClusterSettings.GossipPort`), then by
 the advertised name (host name, IP or `OverrideHostname`). If nothing matches,
 or several nodes do, the request fails with an error.
 
-Known limits: if the target node dies, the terminal stays open until it is
-closed, and `/exec` and `/inspect` still run on whichever node receives the
+Both sides of a session ping each other every 10 seconds. If one side hears
+nothing for 30 seconds, or can't reach the other node at all, it ends the
+session: the browser shows "node … stopped responding" and the shell is killed
+on its node. So a node that crashes or drops out of the cluster leaves neither
+a hung terminal nor a stray shell.
+
+Known limit: `/exec` and `/inspect` still run on whichever node receives the
 command.
 
 ## Slash commands

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/creack/pty"
@@ -27,6 +28,9 @@ type edgeSession struct {
 
 	inSeq uint64 // next input sequence number; only the socket reader uses it
 
+	opened   atomic.Bool  // the target confirmed the shell started
+	lastSeen atomic.Int64 // unix nanos of the last message from the target
+
 	mu      sync.Mutex // serializes output writes and guards the fields below
 	out     *sequencer[[]byte]
 	closing bool   // the target ended the session...
@@ -39,6 +43,8 @@ type targetSession struct {
 	self   string
 	origin string
 	term   *terminalSession
+
+	lastSeen atomic.Int64 // unix nanos of the last message from the edge
 
 	mu sync.Mutex // serializes PTY input and guards in
 	in *sequencer[*clusterMessage]
@@ -58,6 +64,15 @@ type relay struct {
 	// logWarn logs a warning.
 	logWarn func(msg string, keyValuePairs ...any)
 
+	// Each side of a session pings the other every pingInterval and ends the
+	// session when it hears nothing for peerTimeout, so a node that dies or
+	// drops out of the cluster doesn't leave a hung terminal or a shell nobody
+	// can reach.
+	pingInterval time.Duration
+	peerTimeout  time.Duration
+	stop         chan struct{}
+	stopOnce     sync.Once
+
 	mu      sync.Mutex
 	pending map[string]chan *clusterMessage
 	edges   map[string]*edgeSession
@@ -66,10 +81,80 @@ type relay struct {
 
 func newRelay() *relay {
 	return &relay{
-		pending: make(map[string]chan *clusterMessage),
-		edges:   make(map[string]*edgeSession),
-		targets: make(map[string]*targetSession),
+		pingInterval: 10 * time.Second,
+		peerTimeout:  30 * time.Second,
+		stop:         make(chan struct{}),
+		pending:      make(map[string]chan *clusterMessage),
+		edges:        make(map[string]*edgeSession),
+		targets:      make(map[string]*targetSession),
 	}
+}
+
+// start runs the heartbeat until closeAll.
+func (r *relay) start() {
+	go func() {
+		ticker := time.NewTicker(r.pingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-r.stop:
+				return
+			case now := <-ticker.C:
+				r.beat(now)
+			}
+		}
+	}()
+}
+
+// beat pings the peer of every session and ends sessions whose peer has gone
+// quiet or can't be reached. Each check runs on its own goroutine because a
+// send to a dead node can block for a long time.
+func (r *relay) beat(now time.Time) {
+	r.mu.Lock()
+	edges := make([]*edgeSession, 0, len(r.edges))
+	for _, es := range r.edges {
+		if es.opened.Load() { // until then the open request has its own timeout
+			edges = append(edges, es)
+		}
+	}
+	targets := make([]*targetSession, 0, len(r.targets))
+	for _, ts := range r.targets {
+		targets = append(targets, ts)
+	}
+	r.mu.Unlock()
+
+	for _, es := range edges {
+		go func() {
+			err := r.checkPeer(now, es.lastSeen.Load(), es.target, &clusterMessage{Type: msgPing, From: es.self, SID: es.sid})
+			if err != nil && r.dropEdge(es.sid) {
+				r.logWarn("Ending remote terminal", "node", es.target, "session_id", es.sid, "error", err.Error())
+				es.mu.Lock()
+				_ = es.sock.WriteMessage(websocket.TextMessage, []byte(err.Error()))
+				es.mu.Unlock()
+				_ = es.sock.Close()
+			}
+		}()
+	}
+	for _, ts := range targets {
+		go func() {
+			err := r.checkPeer(now, ts.lastSeen.Load(), ts.origin, &clusterMessage{Type: msgPing, From: ts.self, SID: ts.sid})
+			if err != nil && r.dropTarget(ts.sid) {
+				r.logWarn("Ending shell for remote terminal", "node", ts.origin, "session_id", ts.sid, "error", err.Error())
+			}
+		}()
+	}
+}
+
+// checkPeer reports whether the peer has been silent too long, and otherwise
+// pings it.
+func (r *relay) checkPeer(now time.Time, lastSeen int64, peer string, ping *clusterMessage) error {
+	if now.Sub(time.Unix(0, lastSeen)) > r.peerTimeout {
+		return fmt.Errorf("node %s stopped responding", peer)
+	}
+	if err := r.publish(peer, ping); err != nil {
+		return fmt.Errorf("node %s is unreachable: %w", peer, err)
+	}
+	return nil
 }
 
 // request sends msg to target and waits for the reply. A reply that carries
@@ -144,6 +229,8 @@ func (r *relay) openEdge(sock frameSocket, self, target, userID, shell string) (
 		r.dropEdge(es.sid)
 		return nil, "", err
 	}
+	es.lastSeen.Store(time.Now().UnixNano())
+	es.opened.Store(true)
 	return es, resp.Shell, nil
 }
 
@@ -203,6 +290,28 @@ func (r *relay) handle(msg *clusterMessage) {
 		r.handleOutput(msg)
 	case msgClose:
 		r.handleClose(msg)
+	case msgPing:
+		r.handlePing(msg)
+	}
+}
+
+// handlePing records that the peer of a session is alive. A ping for a
+// session this node doesn't have means the peer outlived its partner here, so
+// it is told to end the session.
+func (r *relay) handlePing(msg *clusterMessage) {
+	now := time.Now().UnixNano()
+	r.mu.Lock()
+	es, isEdge := r.edges[msg.SID]
+	ts, isTarget := r.targets[msg.SID]
+	r.mu.Unlock()
+
+	switch {
+	case isEdge:
+		es.lastSeen.Store(now)
+	case isTarget:
+		ts.lastSeen.Store(now)
+	default:
+		_ = r.publish(msg.From, &clusterMessage{Type: msgClose, SID: msg.SID})
 	}
 }
 
@@ -240,6 +349,7 @@ func (r *relay) handleOpen(msg *clusterMessage) {
 		term:   term,
 		in:     newSequencer[*clusterMessage](),
 	}
+	ts.lastSeen.Store(time.Now().UnixNano())
 	r.mu.Lock()
 	r.targets[ts.sid] = ts
 	r.mu.Unlock()
@@ -284,6 +394,7 @@ func (r *relay) handleInput(msg *clusterMessage) {
 	if !ok {
 		return
 	}
+	ts.lastSeen.Store(time.Now().UnixNano())
 
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
@@ -314,6 +425,7 @@ func (r *relay) handleOutput(msg *clusterMessage) {
 		_ = r.publish(msg.From, &clusterMessage{Type: msgClose, SID: msg.SID})
 		return
 	}
+	es.lastSeen.Store(time.Now().UnixNano())
 
 	es.mu.Lock()
 	defer es.mu.Unlock()
@@ -368,8 +480,11 @@ func (r *relay) dropTarget(sid string) bool {
 	return ok
 }
 
-// closeAll ends every session on deactivation and tells the other nodes.
+// closeAll ends every session on deactivation, tells the other nodes and
+// stops the heartbeat.
 func (r *relay) closeAll() {
+	r.stopOnce.Do(func() { close(r.stop) })
+
 	r.mu.Lock()
 	edges := r.edges
 	targets := r.targets

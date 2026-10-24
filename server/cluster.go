@@ -39,6 +39,7 @@ const (
 	msgClose       = "close"  // either way: session is over
 	msgShells      = "shells" // edge -> target: list shells (request)
 	msgReply       = "reply"  // response to a request
+	msgPing        = "ping"   // either way: heartbeat for a session
 	requestTimeout = 10 * time.Second
 
 	// maxReorder bounds how many out-of-order messages a session buffers before

@@ -21,6 +21,26 @@ import (
 type fakeCluster struct {
 	mu    sync.Mutex
 	nodes map[string]*relay
+	down  map[string]bool // nodes that silently lose everything sent to or from them
+}
+
+// partition cuts id off: messages to and from it are silently lost, as when a
+// node hangs or the network between nodes fails.
+func (c *fakeCluster) partition(id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.down == nil {
+		c.down = make(map[string]bool)
+	}
+	c.down[id] = true
+}
+
+// remove takes id out of the cluster: sends to it fail, as when a node has
+// left.
+func (c *fakeCluster) remove(id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.nodes, id)
 }
 
 func (c *fakeCluster) add(id string, r *relay) {
@@ -33,9 +53,13 @@ func (c *fakeCluster) add(id string, r *relay) {
 	r.publish = func(target string, msg *clusterMessage) error {
 		c.mu.Lock()
 		dst, ok := c.nodes[target]
+		lost := c.down[id] || c.down[target]
 		c.mu.Unlock()
 		if !ok {
 			return errors.New("unknown node " + target)
+		}
+		if lost {
+			return nil
 		}
 		data, err := json.Marshal(msg)
 		if err != nil {
@@ -93,24 +117,28 @@ func spawnCommand(name string, args ...string) func(string, string) (*terminalSe
 	}
 }
 
-func newTestRelay(spawn func(string, string) (*terminalSession, shellInfo, error)) *relay {
+func newTestRelay(t *testing.T, spawn func(string, string) (*terminalSession, shellInfo, error)) *relay {
 	r := newRelay()
+	r.pingInterval = 20 * time.Millisecond
+	r.peerTimeout = 200 * time.Millisecond
 	r.allowed = func(userID string) bool { return userID == "admin" }
 	r.spawn = spawn
 	r.shells = func(string) ([]shellInfo, string) {
 		return []shellInfo{{Name: "bash", Path: "/bin/bash"}, {Name: "zsh", Path: "/bin/zsh"}}, "zsh"
 	}
 	r.logWarn = func(string, ...any) {}
+	r.start()
+	t.Cleanup(r.closeAll)
 	return r
 }
 
 // newTestCluster returns an edge relay "a" and a target relay "b".
-func newTestCluster(spawn func(string, string) (*terminalSession, shellInfo, error)) (edge, target *relay) {
-	edge, target = newTestRelay(nil), newTestRelay(spawn)
-	var c fakeCluster
+func newTestCluster(t *testing.T, spawn func(string, string) (*terminalSession, shellInfo, error)) (edge, target *relay, c *fakeCluster) {
+	edge, target = newTestRelay(t, nil), newTestRelay(t, spawn)
+	c = &fakeCluster{}
 	c.add("a", edge)
 	c.add("b", target)
-	return edge, target
+	return edge, target, c
 }
 
 func sessionCounts(r *relay) (edges, targets int) {
@@ -120,7 +148,7 @@ func sessionCounts(r *relay) (edges, targets int) {
 }
 
 func TestRelayRoundTrip(t *testing.T) {
-	edge, target := newTestCluster(spawnCommand("cat"))
+	edge, target, _ := newTestCluster(t, spawnCommand("cat"))
 	sock := &fakeSocket{}
 
 	es, shell, err := edge.openEdge(sock, "a", "b", "admin", "")
@@ -148,7 +176,7 @@ func TestRelayRoundTrip(t *testing.T) {
 }
 
 func TestRelayShellExitClosesSocketAfterOutput(t *testing.T) {
-	edge, target := newTestCluster(spawnCommand("sh", "-c", "printf 'one two three'"))
+	edge, target, _ := newTestCluster(t, spawnCommand("sh", "-c", "printf 'one two three'"))
 	sock := &fakeSocket{}
 
 	_, _, err := edge.openEdge(sock, "a", "b", "admin", "")
@@ -169,7 +197,7 @@ func TestRelayShellExitClosesSocketAfterOutput(t *testing.T) {
 
 func TestRelayOpenForbidden(t *testing.T) {
 	spawned := false
-	edge, _ := newTestCluster(func(string, string) (*terminalSession, shellInfo, error) {
+	edge, _, _ := newTestCluster(t, func(string, string) (*terminalSession, shellInfo, error) {
 		spawned = true
 		return nil, shellInfo{}, errors.New("unreachable")
 	})
@@ -183,7 +211,7 @@ func TestRelayOpenForbidden(t *testing.T) {
 }
 
 func TestRelayOpenSpawnError(t *testing.T) {
-	edge, _ := newTestCluster(func(string, string) (*terminalSession, shellInfo, error) {
+	edge, _, _ := newTestCluster(t, func(string, string) (*terminalSession, shellInfo, error) {
 		return nil, shellInfo{}, errors.New("no supported shell found on the host")
 	})
 
@@ -193,7 +221,7 @@ func TestRelayOpenSpawnError(t *testing.T) {
 }
 
 func TestRelayOpenUnknownNode(t *testing.T) {
-	edge, _ := newTestCluster(spawnCommand("cat"))
+	edge, _, _ := newTestCluster(t, spawnCommand("cat"))
 
 	_, _, err := edge.openEdge(&fakeSocket{}, "a", "nope", "admin", "")
 	require.Error(t, err)
@@ -202,7 +230,7 @@ func TestRelayOpenUnknownNode(t *testing.T) {
 }
 
 func TestRelayRemoteShells(t *testing.T) {
-	edge, _ := newTestCluster(nil)
+	edge, _, _ := newTestCluster(t, nil)
 
 	shells, selected, err := edge.remoteShells("a", "b", "admin")
 	require.NoError(t, err)
@@ -214,7 +242,7 @@ func TestRelayRemoteShells(t *testing.T) {
 }
 
 func TestRelayCloseAll(t *testing.T) {
-	edge, target := newTestCluster(spawnCommand("cat"))
+	edge, target, _ := newTestCluster(t, spawnCommand("cat"))
 	sock := &fakeSocket{}
 
 	_, _, err := edge.openEdge(sock, "a", "b", "admin", "")
@@ -231,7 +259,7 @@ func TestRelayCloseAll(t *testing.T) {
 }
 
 func TestRelayOrphanedShellIsClosed(t *testing.T) {
-	edge, target := newTestCluster(spawnCommand("sh", "-c", "echo ready; exec cat"))
+	edge, target, _ := newTestCluster(t, spawnCommand("sh", "-c", "echo ready; exec cat"))
 
 	// An open arriving at the target with no edge session waiting for it, as
 	// when the edge's request timed out first.
@@ -245,6 +273,92 @@ func TestRelayOrphanedShellIsClosed(t *testing.T) {
 	}, 5*time.Second, 10*time.Millisecond)
 	edges, _ := sessionCounts(edge)
 	assert.Zero(t, edges)
+}
+
+func TestRelayIdleSessionStaysOpen(t *testing.T) {
+	edge, target, _ := newTestCluster(t, spawnCommand("cat"))
+	sock := &fakeSocket{}
+
+	_, _, err := edge.openEdge(sock, "a", "b", "admin", "")
+	require.NoError(t, err)
+
+	// Several timeouts pass with no input or output; the pings keep it alive.
+	time.Sleep(5 * edge.peerTimeout)
+	_, closed := sock.state()
+	assert.False(t, closed)
+	edges, _ := sessionCounts(edge)
+	_, targets := sessionCounts(target)
+	assert.Equal(t, 1, edges)
+	assert.Equal(t, 1, targets)
+}
+
+func TestRelayPeerFailure(t *testing.T) {
+	tests := []struct {
+		name    string
+		fail    func(c *fakeCluster)
+		wantMsg string
+	}{
+		{name: "target goes silent", fail: func(c *fakeCluster) { c.partition("b") }, wantMsg: "stopped responding"},
+		{name: "target leaves the cluster", fail: func(c *fakeCluster) { c.remove("b") }, wantMsg: "unreachable"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			edge, target, c := newTestCluster(t, spawnCommand("cat"))
+			sock := &fakeSocket{}
+
+			_, _, err := edge.openEdge(sock, "a", "b", "admin", "")
+			require.NoError(t, err)
+
+			tt.fail(c)
+
+			// The edge tells the browser and closes the socket.
+			require.Eventually(t, func() bool {
+				_, closed := sock.state()
+				return closed
+			}, 5*time.Second, 10*time.Millisecond)
+			out, _ := sock.state()
+			assert.Contains(t, out, tt.wantMsg)
+			edges, _ := sessionCounts(edge)
+			assert.Zero(t, edges)
+
+			// The target, cut off from the edge, ends the shell.
+			require.Eventually(t, func() bool {
+				_, targets := sessionCounts(target)
+				return targets == 0
+			}, 5*time.Second, 10*time.Millisecond)
+		})
+	}
+}
+
+func TestRelayEdgeFailureEndsShell(t *testing.T) {
+	edge, target, c := newTestCluster(t, spawnCommand("cat"))
+
+	_, _, err := edge.openEdge(&fakeSocket{}, "a", "b", "admin", "")
+	require.NoError(t, err)
+
+	c.partition("a")
+
+	require.Eventually(t, func() bool {
+		_, targets := sessionCounts(target)
+		return targets == 0
+	}, 5*time.Second, 10*time.Millisecond)
+}
+
+func TestRelayPingForUnknownSessionCloses(t *testing.T) {
+	edge, target, _ := newTestCluster(t, spawnCommand("cat"))
+	sock := &fakeSocket{}
+
+	es, _, err := edge.openEdge(sock, "a", "b", "admin", "")
+	require.NoError(t, err)
+
+	// The edge forgets the session without telling the target, as after a
+	// restart. The target's next ping gets a close back.
+	edge.dropEdge(es.sid)
+
+	require.Eventually(t, func() bool {
+		_, targets := sessionCounts(target)
+		return targets == 0
+	}, 5*time.Second, 10*time.Millisecond)
 }
 
 func TestSequencer(t *testing.T) {
