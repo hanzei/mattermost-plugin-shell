@@ -28,6 +28,15 @@ test('finds the last selected node by host name after it restarted with a new ID
     expect(pickNode(nodes)).toBe(nodes[1]);
 });
 
+test('tells apart restarted nodes that share a host name by address', () => {
+    const shared = [
+        {id: 'id-a', hostname: 'host', ipaddress: '10.0.0.1:8074'},
+        {id: 'id-b', hostname: 'host', ipaddress: '10.0.0.1:8075'},
+    ];
+    saveNode({...shared[1], id: 'old-id'});
+    expect(pickNode(shared)).toBe(shared[1]);
+});
+
 test('falls back to the first node when the saved one is gone', () => {
     saveNode({id: 'gone', hostname: '10.0.0.9', ipaddress: '10.0.0.9:8074'});
     expect(pickNode(nodes)).toBe(nodes[0]);

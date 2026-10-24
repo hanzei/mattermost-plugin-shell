@@ -145,15 +145,22 @@ type terminalSession struct {
 	id   string
 	ptmx *os.File
 	cmd  *exec.Cmd
+
+	closeOnce sync.Once
 }
 
+// close kills the shell and reaps it, so it doesn't linger as a zombie. It is
+// safe to call more than once.
 func (s *terminalSession) close() {
-	if s.ptmx != nil {
-		_ = s.ptmx.Close()
-	}
-	if s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
-	}
+	s.closeOnce.Do(func() {
+		if s.ptmx != nil {
+			_ = s.ptmx.Close()
+		}
+		if s.cmd != nil && s.cmd.Process != nil {
+			_ = s.cmd.Process.Kill()
+			go func() { _ = s.cmd.Wait() }()
+		}
+	})
 }
 
 // sessionManager tracks active sessions so they can all be torn down on plugin
@@ -215,15 +222,8 @@ func (p *Plugin) handleTerminal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Start the shell before upgrading so we can fail cleanly if none exist.
-	session, shell, err := p.startShell(userID, query.Get("shell"))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	p.terminals.add(session)
-	defer p.terminals.remove(session.id)
-
+	// Upgrade (and so check the Origin) before starting anything, so a
+	// cross-origin request never spawns a shell or saves a preference.
 	conn, err := p.upgrader().Upgrade(w, r, nil)
 	if err != nil {
 		// Upgrade already wrote an error response on failure.
@@ -231,6 +231,15 @@ func (p *Plugin) handleTerminal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = conn.Close() }()
+
+	session, shell, err := p.startShell(userID, query.Get("shell"))
+	if err != nil {
+		// Text frames are shown to the user as errors.
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(err.Error()))
+		return
+	}
+	p.terminals.add(session)
+	defer p.terminals.remove(session.id)
 
 	ptmx := session.ptmx
 
@@ -286,8 +295,8 @@ func (p *Plugin) relayTerminal(w http.ResponseWriter, r *http.Request, userID, s
 
 	es, shellName, err := p.relay.openEdge(conn, self, target, userID, shell)
 	if err != nil {
+		// openEdge already told the browser; output handlers may share the socket.
 		p.API.LogError("Failed to open remote terminal", "node", target, "error", err.Error())
-		_ = conn.WriteMessage(websocket.TextMessage, []byte("failed to start shell on node "+target+": "+err.Error()))
 		return
 	}
 	defer p.relay.closeEdge(es)

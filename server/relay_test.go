@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -359,6 +360,89 @@ func TestRelayPingForUnknownSessionCloses(t *testing.T) {
 		_, targets := sessionCounts(target)
 		return targets == 0
 	}, 5*time.Second, 10*time.Millisecond)
+}
+
+func TestRelayDuplicateOpenKeepsOneShell(t *testing.T) {
+	var mu sync.Mutex
+	var spawned []*terminalSession
+	spawn := spawnCommand("cat")
+	_, target, _ := newTestCluster(t, func(userID, shell string) (*terminalSession, shellInfo, error) {
+		term, info, err := spawn(userID, shell)
+		mu.Lock()
+		spawned = append(spawned, term)
+		mu.Unlock()
+		return term, info, err
+	})
+
+	open := &clusterMessage{Type: msgOpen, From: "a", To: "b", SID: model.NewId(), UserID: "admin"}
+	target.handle(open)
+	target.handle(open)
+
+	_, targets := sessionCounts(target)
+	assert.Equal(t, 1, targets)
+
+	// The duplicate's shell was killed and reaped; the registered one still runs.
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, spawned, 2)
+	require.Eventually(t, func() bool {
+		return !processExists(spawned[1].cmd.Process.Pid)
+	}, 5*time.Second, 10*time.Millisecond)
+	assert.True(t, processExists(spawned[0].cmd.Process.Pid))
+}
+
+// processExists reports whether pid is a live or unreaped process.
+func processExists(pid int) bool {
+	return syscall.Kill(pid, 0) == nil
+}
+
+func TestTerminalSessionCloseReapsShell(t *testing.T) {
+	term, _, err := spawnCommand("cat")("", "")
+	require.NoError(t, err)
+
+	term.close()
+	term.close() // safe to repeat
+
+	require.Eventually(t, func() bool {
+		return !processExists(term.cmd.Process.Pid)
+	}, 5*time.Second, 10*time.Millisecond, "killed shell left as a zombie")
+}
+
+func TestRelayDuplicateReplyDoesNotBlock(t *testing.T) {
+	r := newTestRelay(t, nil)
+	ch := make(chan *clusterMessage, 1)
+	r.mu.Lock()
+	r.pending["req"] = ch
+	r.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		r.handle(&clusterMessage{Type: msgReply, ReqID: "req"})
+		r.handle(&clusterMessage{Type: msgReply, ReqID: "req"})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second reply blocked the handler")
+	}
+	assert.Len(t, ch, 1)
+}
+
+func TestRelayIgnoresMessagesAfterClose(t *testing.T) {
+	spawned := false
+	_, target, _ := newTestCluster(t, func(string, string) (*terminalSession, shellInfo, error) {
+		spawned = true
+		return nil, shellInfo{}, errors.New("unreachable")
+	})
+
+	target.closeAll()
+	target.handle(&clusterMessage{Type: msgOpen, From: "a", To: "b", SID: model.NewId(), UserID: "admin"})
+
+	assert.False(t, spawned)
+	_, targets := sessionCounts(target)
+	assert.Zero(t, targets)
 }
 
 func TestSequencer(t *testing.T) {

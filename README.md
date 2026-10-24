@@ -45,8 +45,8 @@ Click the terminal button in the channel header to open it.
 In a cluster, a **Node** dropdown appears next to the shell picker, listing the
 connected nodes from `/api/v4/cluster/status`. The first node is selected by
 default; after that, the panel opens on the node you picked last (remembered
-per browser, by node ID and, since IDs change when a node restarts, by host
-name).
+per browser, by node ID and, since IDs change when a node restarts, by gossip
+address and host name).
 
 The browser's WebSocket lands on whichever node the load balancer picks (the
 *edge*), and the shell runs on the chosen node (the *target*). The two exchange keystrokes and output over plugin cluster

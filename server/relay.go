@@ -227,6 +227,10 @@ func (r *relay) openEdge(sock frameSocket, self, target, userID, shell string) (
 	})
 	if err != nil {
 		r.dropEdge(es.sid)
+		// A late output message may be writing to the socket; serialize with it.
+		es.mu.Lock()
+		_ = sock.WriteMessage(websocket.TextMessage, []byte("failed to start shell on node "+target+": "+err.Error()))
+		es.mu.Unlock()
 		return nil, "", err
 	}
 	es.lastSeen.Store(time.Now().UnixNano())
@@ -272,13 +276,22 @@ func (r *relay) dropEdge(sid string) bool {
 
 // handle dispatches one envelope from another node.
 func (r *relay) handle(msg *clusterMessage) {
+	select {
+	case <-r.stop:
+		return // deactivated: don't start shells nobody will tear down
+	default:
+	}
+
 	switch msg.Type {
 	case msgReply:
 		r.mu.Lock()
 		ch, ok := r.pending[msg.ReqID]
 		r.mu.Unlock()
 		if ok {
-			ch <- msg
+			select {
+			case ch <- msg:
+			default: // duplicate reply; the first one wins
+			}
 		}
 	case msgShells:
 		r.handleShells(msg)
@@ -351,6 +364,12 @@ func (r *relay) handleOpen(msg *clusterMessage) {
 	}
 	ts.lastSeen.Store(time.Now().UnixNano())
 	r.mu.Lock()
+	if _, dup := r.targets[ts.sid]; dup {
+		// A duplicate open; the first one already started the session.
+		r.mu.Unlock()
+		term.close()
+		return
+	}
 	r.targets[ts.sid] = ts
 	r.mu.Unlock()
 

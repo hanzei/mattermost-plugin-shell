@@ -169,7 +169,6 @@ const HostTerminal: React.FC = () => {
             return undefined; // wait for the node list
         }
         let cancelled = false;
-        setSelected(null); // hold the socket until the node's shells are known
         fetch(pluginURL('shells', routeParams(node, nodesRef.current)), {credentials: 'same-origin'}).
             then((res) => res.json()).
             then((data: ShellsResponse) => {
@@ -278,6 +277,11 @@ const HostTerminal: React.FC = () => {
                                 const picked = nodes.find((n) => n.id === e.target.value);
                                 if (picked) {
                                     saveNode(picked);
+
+                                    // Hold the socket until the node's shells
+                                    // are known; set together with the node so
+                                    // no render connects with the old shell.
+                                    setSelected(null);
                                     setNode(picked.id);
                                 }
                             }}
